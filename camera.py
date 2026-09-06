@@ -23,6 +23,7 @@ until then.
 import math
 import sensor
 import time
+from pyb import Servo
 
 # --- camera setup -----------------------------------------------------------
 
@@ -42,6 +43,51 @@ FULL_W = _full_frame.width()
 FULL_H = _full_frame.height()
 
 _auto_exposure_us = sensor.get_exposure_us()
+
+# --- pan/tilt -----------------------------------------------------------
+#
+# SingTown OpenMV-Pan-Tilt bracket (github.com/SingTown/OpenMV-Pan-Tilt --
+# mechanical design only, no example code of its own). Servos plug into
+# the OpenMV H7 Plus's own two dedicated PWM headers.
+#
+# Confirmed by running pantilt_test.py, not assumed:
+#   pyb.Servo(1) -> P7 -> pan
+#   pyb.Servo(2) -> P8 -> tilt
+#   Pan's native direction is inverted from "positive = right" -- set_pan()
+#   corrects for that, so positive = right everywhere, matching
+#   estimate_bearing_deg() below (also positive = right of centre).
+#   Tilt's native direction already matches design.md's mount convention
+#   (positive = down/forward, negative = up toward horizontal) -- no
+#   correction needed.
+#   Still unconfirmed: what real-world angle 0 (centre) actually points at
+#   on either axis -- depends on how the bracket is physically bolted on,
+#   not something software alone can tell you. PAN_OFFSET_DEG/
+#   TILT_OFFSET_DEG below are the hardware trim for exactly that: command
+#   logical 0 with both at 0, check where the camera actually rests
+#   against a level, then adjust the offset (in raw servo degrees) until
+#   logical 0 is the real rest position you want. Applied last, after the
+#   sign correction, so they're a pure hardware trim independent of the
+#   pan/bearing sign convention above.
+#
+# Always call set_pan()/set_tilt(), never pan.angle()/tilt.angle()
+# directly, so the pan correction and these offsets can't get missed
+# somewhere.
+pan = Servo(1)   # P7
+tilt = Servo(2)  # P8
+
+PAN_OFFSET_DEG = 0   # untested -- raw servo-degree trim, see note above
+TILT_OFFSET_DEG = 0  # untested -- raw servo-degree trim, see note above
+
+
+def set_pan(angle_deg, time_ms=0):
+    """Positive = right, negative = left."""
+    pan.angle(-angle_deg + PAN_OFFSET_DEG, time_ms)
+
+
+def set_tilt(angle_deg, time_ms=0):
+    """Positive = down/forward, negative = up toward horizontal."""
+    tilt.angle(angle_deg + TILT_OFFSET_DEG, time_ms)
+
 
 # --- mode switch -------------------------------------------------------------
 
@@ -84,6 +130,23 @@ LINE_BRIGHTNESS_FRACTION = 0.5
 # patch of floor instead of the whole scene.
 ZONE_WINDOW_W_FRAC = 1
 ZONE_WINDOW_H_FRAC = 1
+
+# Tilt angle while each mode is active -- "tilt forwards" for ZONE mode
+# means angling the camera further down/forward to see the floor ahead
+# for spheres and triangles; LINE mode returns to centre (0).
+#
+# Negative here despite pantilt_test.py confirming +30 = down/forward:
+# testing this in camera.py at +60 tilted backwards instead, the
+# opposite of that result. Scoped to just this constant rather than
+# flipping set_tilt()'s general sign convention, since LINE mode's tilt
+# (0, no sign to get wrong) hasn't shown a problem -- something either
+# changed physically since the isolated test (a servo horn reseated in a
+# different spline position is a common cause), or the confirmed
+# direction doesn't hold all the way out at 60 deg. Worth re-running
+# pantilt_test.py at +/-60 specifically to find out which, rather than
+# trusting this sign is right just because reversing it worked here.
+TILT_ZONE_DEG = -60
+TILT_LINE_DEG = 0
 
 # The silver balls are pressed, scrunched foil, not a smooth mirror --
 # lots of small facets each catching light at a different angle, not one
@@ -135,7 +198,7 @@ SPHERE_R_MAX_PX = 60  # untested, depends on scan distance and window size
 # measure at a couple of known real distances -- if there's a consistent
 # offset or scale error, that's these constants needing correction, not a
 # bug in the formula itself.
-CAMERA_HEIGHT_MM = 150    # camera lens height above the floor
+CAMERA_HEIGHT_MM = 120    # camera lens height above the floor
 CAMERA_TILT_DEG = 30      # angle of the optical axis below horizontal;
                           # 0 = looking at the horizon, 90 = straight down
 CAMERA_VFOV_DEG = 45      # vertical field of view of the CURRENT frame --
@@ -594,8 +657,10 @@ if ZONE_MODE_ENABLED:
     _win_y = (FULL_H - _win_h) // 2
     sensor.set_windowing((_win_x, _win_y, _win_w, _win_h))
     _set_brightness(ZONE_BRIGHTNESS_FRACTION)
+    set_tilt(TILT_ZONE_DEG)
 else:
     _set_brightness(LINE_BRIGHTNESS_FRACTION)
+    set_tilt(TILT_LINE_DEG)
 
 # --- main loop -------------------------------------------------------------
 
