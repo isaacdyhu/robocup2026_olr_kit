@@ -12,12 +12,14 @@ Merges two scripts that were developed and tuned separately:
     still works standalone if ZONE mode needs isolated tuning again;
     this is where its tuned constants and functions land once they work.
 
-ZONE_MODE_ENABLED below is a manual switch, for now: it picks ONE mode
-for the whole run rather than automatically transitioning between them
-the way design.md's real state machine does (state B: white background,
-no line found, for real -- not a hand-flipped constant). Automatic
-switching is future work; flip this and re-run to test the other mode
-until then.
+Mode is now driven by Hub 1 over PUPRemote (the "mode" command, see the
+hub link section below) rather than only the hand-flipped
+ZONE_MODE_ENABLED constant -- that constant is still there as the
+startup default/fallback if the hub link is never connected. This is
+still not design.md's real automatic switching (state B: a genuine white
+background/no-line-found condition) -- it's Hub 1 choosing the mode
+(by button press, in the test script this pairs with), just relayed
+over the link instead of edited into this file by hand.
 """
 
 import math
@@ -75,8 +77,8 @@ _auto_exposure_us = sensor.get_exposure_us()
 pan = Servo(1)   # P7
 tilt = Servo(2)  # P8
 
-PAN_OFFSET_DEG = 0   # untested -- raw servo-degree trim, see note above
-TILT_OFFSET_DEG = 0  # untested -- raw servo-degree trim, see note above
+PAN_OFFSET_DEG = 10   # untested -- raw servo-degree trim, see note above
+TILT_OFFSET_DEG = -10  # untested -- raw servo-degree trim, see note above
 
 
 def set_pan(angle_deg, time_ms=0):
@@ -91,9 +93,96 @@ def set_tilt(angle_deg, time_ms=0):
 
 # --- mode switch -------------------------------------------------------------
 
-# Manual for now (see the file header) -- True runs ZONE mode for the
-# whole session, False runs LINE mode. Flip and re-run to test the other.
+# Startup default / fallback if the hub link below is never connected or
+# never sends a command -- the script still runs standalone this way,
+# same as before the hub link existed. Once Hub 1 calls the "mode"
+# command (see the PUPRemote section below), `zone_mode` is what actually
+# drives the main loop, kept up to date by that command's callback.
 ZONE_MODE_ENABLED = False
+zone_mode = ZONE_MODE_ENABLED
+
+# --- hub link (PUPRemote) -----------------------------------------------
+#
+# UNTESTED END TO END: this is the first real run of this command in
+# either direction. Needs pupremote.py + lpf2.py
+# (github.com/antonvh/PUPRemote) copied onto the camera's own storage --
+# still not done as of writing, per every earlier note in this file's
+# history saying so.
+#
+# One command, "mode": Hub 1 sends the desired zone_mode as a single
+# byte (0/1); this replies with 8 shorts (16 bytes -- exactly Pybricks'
+# max_packet_size, and a power-of-two LPF2 payload per design.md Sec3):
+#
+#   (echoed_mode, heartbeat, f2, f3, f4, f5, f6, f7)
+#
+# f2..f7 mean different things depending on echoed_mode, since the hub
+# already knows which mode it just asked for:
+#   LINE (echoed_mode=0): ahead, angle, length, coverage, background_code, 0
+#     background_code: 0=black, 1=white, 2=unclear (see BACKGROUND_CODE)
+#   ZONE (echoed_mode=1): sphere_count, first_kind, first_bearing_deg,
+#                         first_dist_mm, green_found, red_found
+#     first_kind: -1=no sphere, 0=dead, 1=live -- only the first (not
+#     necessarily nearest) sphere found; sphere_count says how many were
+#     really out there. A fixed 8-field reply can't carry a variable-length
+#     list, which is the real constraint driving this whole design.
+#
+# Both caches below are updated once per frame in the main loop, and
+# mode() just reads whichever one matches current zone_mode -- same
+# "peripherals precompute, callbacks just read the cache" pattern as
+# LINE/ZONE mode's own vision functions.
+#
+# sensor_id is a placeholder (SPIKE_Ultrasonic, matching Anton's
+# Mindstorms' own OpenMV examples) -- match it to whatever Hub 1's own
+# PUPRemoteHub setup expects; that value isn't recorded in design.md.
+#
+# No `platform=OPENMV` here: that was based on a blog post describing an
+# older version of this library. Checked directly against the actual
+# current pupremote.py source -- OPENMV isn't defined there at all, and
+# PUPRemoteSensor's constructor takes no platform argument any more, just
+# sensor_id (and optional power/max_packet_size).
+from pupremote import PUPRemoteSensor
+
+SPIKE_Ultrasonic = 62
+
+BACKGROUND_CODE = {"black": 0, "white": 1, "unclear": 2}
+
+_heartbeat = 0
+_last_line_result = (0, 0, 0, 0, 2, 0)          # ahead, angle, length, coverage, bg_code, unused
+_last_zone_result = (0, -1, 0, 0, 0, 0)         # count, kind, bearing, dist, green_found, red_found
+
+
+def mode(desired_zone_mode):
+    """
+    Callback for the "mode" command -- name must match exactly, per
+    PUPRemote's convention of invoking whatever function matches the
+    registered command name. Runs whenever Hub 1's call() is serviced by
+    _hub_link.process() in the main loop, not on every camera frame.
+
+    Defined BEFORE add_command("mode", ...) below, not after: checked
+    directly against the real add_command() source, and it resolves the
+    callback via eval(mode_name) immediately at registration time, not
+    lazily when the command is actually called -- registering "mode"
+    before this function exists would fail immediately with a NameError.
+    """
+    global zone_mode
+    zone_mode = bool(desired_zone_mode)
+
+    if zone_mode:
+        return (1, _heartbeat) + _last_zone_result
+    else:
+        return (0, _heartbeat) + _last_line_result
+
+
+_hub_link = PUPRemoteSensor(sensor_id=SPIKE_Ultrasonic)
+_hub_link.add_command("mode", to_hub_fmt="hhhhhhhh", from_hub_fmt="b")
+
+# How many times process() gets polled per camera frame, in the main
+# loop below -- see the comment there for why one call per frame isn't
+# enough. Untested value; raise it if switching is still missed often,
+# though each extra call only helps up to the point where Hub 1's own
+# resend rate is the real limit, not this one.
+HUB_POLL_BURST = 10
+
 
 # --- tunables (LINE mode) -----------------------------------------------
 #
@@ -116,9 +205,19 @@ BACKGROUND_COVERAGE = 50   # % of the frame a colour must cover to count as
 # until the first confident background reading.
 DEFAULT_POLARITY = "black"  # "black" or "white"
 
-# LINE cares about black/white line contrast; this is the brightness this
-# file used before ZONE mode's needs were understood.
-LINE_BRIGHTNESS_FRACTION = 0.5
+# Was 0.5 (half of auto-exposure's own reading) -- a leftover from before
+# LINE and ZONE modes had separate brightness settings, when this value
+# was actually chosen to protect the silver balls' contrast from
+# blowing out, a ZONE-mode concern that ZONE_BRIGHTNESS_FRACTION now
+# handles on its own. Nobody had reconsidered what LINE mode itself
+# actually needs since. Confirmed wrong by real evidence: robot sitting
+# squarely on the black line over white background still read wht=0%,
+# meaning the white tile genuinely wasn't bright enough to clear
+# WHITE_THRESHOLD's L>=65 floor -- 0.5 was underexposing a scene plain
+# auto-exposure is normally well suited for. Reset to 1.0 (trust
+# auto-exposure's own reading, no artificial darkening) since LINE mode
+# has no equivalent reason to deviate from it the way ZONE mode does.
+LINE_BRIGHTNESS_FRACTION = 1.0
 
 # --- tunables (ZONE mode) ------------------------------------------------
 #
@@ -146,6 +245,11 @@ ZONE_WINDOW_H_FRAC = 1
 # pantilt_test.py at +/-60 specifically to find out which, rather than
 # trusting this sign is right just because reversing it worked here.
 TILT_ZONE_DEG = -60
+# Reverted back to 0 -- confirmed NOT a tilt problem after all: the
+# camera is correctly positioned directly over the black line on white
+# background, pointing straight down, even while detection was failing.
+# The -30 guess above was based on a wrong diagnosis; the real issue was
+# exposure/saturation (see LINE_BRIGHTNESS_FRACTION's note).
 TILT_LINE_DEG = 0
 
 # The silver balls are pressed, scrunched foil, not a smooth mirror --
@@ -643,34 +747,62 @@ def find_triangle(img, threshold, colour, label):
     return biggest.cx, biggest.cy
 
 
-# --- apply startup mode configuration ----------------------------------------
+# --- apply mode configuration ------------------------------------------------
+#
+# Callable at startup AND whenever zone_mode changes at runtime (driven by
+# the "mode" command above), not just once -- exposure, FOV window and
+# tilt all need to follow the hub's command, not just this file's own
+# ZONE_MODE_ENABLED default.
 
 
 def _set_brightness(fraction):
     sensor.set_auto_exposure(False, exposure_us=int(_auto_exposure_us * fraction))
 
 
-if ZONE_MODE_ENABLED:
-    _win_w = int(FULL_W * ZONE_WINDOW_W_FRAC)
-    _win_h = int(FULL_H * ZONE_WINDOW_H_FRAC)
-    _win_x = (FULL_W - _win_w) // 2
-    _win_y = (FULL_H - _win_h) // 2
-    sensor.set_windowing((_win_x, _win_y, _win_w, _win_h))
-    _set_brightness(ZONE_BRIGHTNESS_FRACTION)
-    set_tilt(TILT_ZONE_DEG)
-else:
-    _set_brightness(LINE_BRIGHTNESS_FRACTION)
-    set_tilt(TILT_LINE_DEG)
+def _apply_mode(enabled):
+    if enabled:
+        _win_w = int(FULL_W * ZONE_WINDOW_W_FRAC)
+        _win_h = int(FULL_H * ZONE_WINDOW_H_FRAC)
+        _win_x = (FULL_W - _win_w) // 2
+        _win_y = (FULL_H - _win_h) // 2
+        sensor.set_windowing((_win_x, _win_y, _win_w, _win_h))
+        _set_brightness(ZONE_BRIGHTNESS_FRACTION)
+        set_tilt(TILT_ZONE_DEG)
+    else:
+        sensor.set_windowing((0, 0, FULL_W, FULL_H))
+        _set_brightness(LINE_BRIGHTNESS_FRACTION)
+        set_tilt(TILT_LINE_DEG)
+
+
+_apply_mode(zone_mode)
 
 # --- main loop -------------------------------------------------------------
 
 tracking = DEFAULT_POLARITY  # LINE mode's persisted polarity guess
+_last_zone_mode = zone_mode
 
 while True:
     clock.tick()
+    _heartbeat = (_heartbeat + 1) % 30000  # wraps well inside a signed short
+
+    # process() only catches a write from Hub 1 if one is sitting in the
+    # LPF2 receive buffer at the exact instant it's called -- checked
+    # directly against the real source, it does one non-blocking byte
+    # check per call. A single call per (slow) camera frame gives Hub 1's
+    # continuous resends very little chance to land, since the hub can
+    # write several times in the gap between two camera frames. Polling
+    # in a burst here is nearly free when nothing's pending (each check
+    # is cheap) and meaningfully widens that window without needing the
+    # vision pipeline itself to get any faster.
+    for _ in range(HUB_POLL_BURST):
+        _hub_link.process()
+
+    if zone_mode != _last_zone_mode:
+        _apply_mode(zone_mode)
+        _last_zone_mode = zone_mode
     img = sensor.snapshot()
 
-    if ZONE_MODE_ENABLED:
+    if zone_mode:
         # --- ZONE mode ------------------------------------------------------
 
         spheres = find_spheres(img)
@@ -683,6 +815,21 @@ while True:
         img.draw_string((4, img.height() - 12), "fps=%.1f" % clock.fps(), color=TEXT_WHITE)
 
         print("ZONE spheres:", spheres, "green:", green_pos, "red:", red_pos)
+
+        # Cache for the "mode" command's reply -- see its comment above
+        # for the field layout. Only the first sphere's info fits; count
+        # still reports how many were really found.
+        if spheres:
+            first_kind, first_x, first_y, first_r, first_dist, first_bearing = spheres[0]
+            kind_code = 1 if first_kind == "live" else 0
+            dist_code = int(first_dist) if first_dist is not None else 0
+            bearing_code = int(round(first_bearing))
+        else:
+            kind_code, dist_code, bearing_code = -1, 0, 0
+        _last_zone_result = (
+            len(spheres), kind_code, bearing_code, dist_code,
+            1 if green_pos else 0, 1 if red_pos else 0,
+        )
 
     else:
         # --- LINE mode --------------------------------------------------
@@ -721,6 +868,12 @@ while True:
 
         print(label, ahead, angle, length, coverage, "| background:", background)
 
+        # Cache for the "mode" command's reply -- see its comment above
+        # for the field layout.
+        _last_line_result = (
+            ahead, angle, length, coverage, BACKGROUND_CODE.get(background, 2), 0,
+        )
+
 # --- next steps -----------------------------------------------------------
 #
 # Automatic switching: design.md Sec6 (state B) triggers ZONE mode from a
@@ -729,11 +882,17 @@ while True:
 # debounce) is the natural next step once both modes are trusted enough
 # to hand control to each other automatically.
 #
-# Hub link: LINE mode's scan()/classify_background() and ZONE mode's
+# Hub link: mode switching is wired up (see the "mode" command above),
+# but that's the only thing Hub 1 can currently ask for or read back --
+# it gets a heartbeat, not real telemetry. LINE mode's
+# scan()/classify_background() and ZONE mode's
 # find_spheres()/find_triangle()/estimate_distance_mm()/
 # estimate_bearing_deg() already compute exactly what design.md's LINE
-# and ZONE reply formats need (Sec3) -- drop the drawing calls, cache
-# results per frame, and wire commands up as PUPRemote channels. That
-# needs pupremote.py + lpf2.py (github.com/antonvh/PUPRemote) copied onto
-# the camera's own storage first -- that's the "OPENMV" import from
-# earlier in this project's history, and it isn't there yet.
+# and ZONE reply formats need (Sec3) -- the natural next step is one or
+# two more commands (e.g. "line" and "zone_targets") that return those
+# results instead of just a heartbeat, following the same pattern as
+# "mode": a global cache updated once per frame, a same-named callback
+# that returns it, add_command() on both this file and the hub script.
+# Still needs pupremote.py + lpf2.py (github.com/antonvh/PUPRemote)
+# actually copied onto the camera's storage before any of this,
+# including "mode", can run -- that step still hasn't been done.
