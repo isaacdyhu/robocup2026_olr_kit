@@ -82,7 +82,7 @@ robot = DriveBase(left_motor, right_motor, WHEEL_DIAMETER_MM, AXLE_TRACK_MM)
 V_MAX = 60        # mm/s, speed at error ~= 0
 V_MIN = 10         # mm/s, speed at or beyond ERROR_FULL
 ERROR_FULL = 60    # error magnitude at which speed reaches V_MIN
-STEER_GAIN = 0.08  # deg/mm of curvature per unit of error
+STEER_GAIN = 0.09  # deg/mm of curvature per unit of error
 TURN_MAX = 300     # deg/s, clamp
 
 # --- tunables: green marker detection (design.md Sec6) ----------------------
@@ -359,12 +359,12 @@ def hunt_for_branch(pivot_offset_mm, turn_sign, far_sensor):
 # to a full 180-degree loop, where wheel slip would accumulate into a
 # real heading error. rotate_to_heading() runs continuously and stops
 # only once the gyro itself confirms the target heading.
-OBSTACLE_TRIGGER_MM = 200         # design.md's exact figure -- ultrasonic
+OBSTACLE_TRIGGER_MM = 220         # design.md's exact figure -- ultrasonic
                                   # threshold for the F -> O guard
-OBSTACLE_SPIN_DEG = 60           # move 1: degrees to turn tangential to
+OBSTACLE_SPIN_DEG = 70           # move 1: degrees to turn tangential to
                                   # the tower
-OBSTACLE_LOOP_DEG = 110          # move 2: half-circle around the tower
-OBSTACLE_PIVOT_RADIUS_MM = 250   # move 2's pivot distance -- a fixed
+OBSTACLE_LOOP_DEG = 120          # move 2: half-circle around the tower
+OBSTACLE_PIVOT_RADIUS_MM = 200   # move 2's pivot distance -- a fixed
                                   # assumed clearance rather than the
                                   # ultrasonic's live reading at trigger
                                   # time, so the loop's radius doesn't
@@ -499,9 +499,15 @@ def state_F():
         print("obstacle: detected within %d mm" % OBSTACLE_TRIGGER_MM)
         return "O"
 
-    # TODO guards, remaining, in this exact priority order (design.md
+    # Guard 3: both inner sensors dark -> X (design.md Sec4 "Guard
+    # ordering within the loop"). Reuses is_black()/BLACK_VAL_MAX --
+    # already the same "on the black line" test the obstacle/green-turn
+    # rejoin hunts use -- rather than a separate threshold.
+    if is_black(l_hsv) and is_black(r_hsv):
+        return "X"
+
+    # TODO guard, remaining, in this exact priority order (design.md
     # Sec4 "Guard ordering within the loop"):
-    #   3. both inner black   -> X
     #   4. line lost 200 mm   -> B
     return None
 
@@ -512,14 +518,47 @@ def state_W():
     return None
 
 
+INTERSECTION_CROSS_MM = 20      # move forward this far to clear the
+                                 # black band before resuming F. Untested
+                                 # placeholder.
+INTERSECTION_CROSS_SPEED_MM_S = 60  # mm/s for the crossing move --
+                                     # applied via robot.settings() below,
+                                     # since straight() itself takes no
+                                     # speed argument (confirmed against
+                                     # Pybricks' own docs: straight()/
+                                     # turn()/arc() use whatever
+                                     # straight_speed/turn_rate was last
+                                     # configured with settings(), unlike
+                                     # drive(), which takes its own speed
+                                     # directly every call).
+
+
 def state_X():
-    """Junction classifier (design.md Sec5)."""
-    # TODO: read the outer sensors, ask the camera if ambiguous, stop,
-    # then dispatch:
-    #   -> F   cases a, b, d, e (corner, crossing, or recovery)
-    #   -> W   case c (black background ahead)
-    #   -> H   cases f, g (camera or hub-2 link unusable)
-    return None
+    """Junction classifier (design.md Sec5) -- simplified: rather than
+    design.md's fuller classifier (read the outer sensors, ask the
+    camera if ambiguous, then dispatch to F/W/H), this always treats the
+    band the same way -- drive straight through it for a fixed distance,
+    then resume F."""
+    # Cancel state_F()'s continuous drive() before taking the blocking
+    # straight() move below -- same reasoning as state_L()/state_R()/
+    # state_O().
+    robot.stop()
+
+    robot.settings(straight_speed=INTERSECTION_CROSS_SPEED_MM_S)
+    robot.straight(INTERSECTION_CROSS_MM)  # DriveBase's own built-in
+                                            # blocking straight-line move
+                                            # -- no hand-rolled loop
+                                            # needed, since this isn't
+                                            # sensor-gated like the
+                                            # obstacle/green-turn hunts
+
+    print("intersection: crossed %d mm, resuming F" % INTERSECTION_CROSS_MM)
+    # TODO: design.md's fuller Sec5 spec can also dispatch to W (case c,
+    # black background ahead -- an inverted-tile seam) or H (cases f, g,
+    # camera/hub-2 link unusable) instead of always resuming F; not
+    # implemented here, this always assumes cases a/b/d/e (corner,
+    # crossing, or recovery).
+    return "F"
 
 
 def state_M():
@@ -686,35 +725,52 @@ STATE_FUNCTIONS = {
 
 # --- debug-stepped main loop -------------------------------------------------
 
+# Master switch for the whole arm-gate mechanism this file's header
+# describes. True (bench/testing): every freshly-entered state starts
+# unarmed and needs one right-button press before its function runs, as
+# described below. False (normal/competition running): that gate is
+# skipped entirely -- every state runs immediately and unattended the
+# instant it's entered, and transitions chain straight into each other
+# with no button presses at all. Flip this and reflash; it isn't wired
+# to a live button, so it can't be changed without stopping the program.
+DEBUG_MODE = False
+
 state = "F"  # starts directly in F rather than S, since S's real
              # start-button wait isn't implemented yet either
 was_pressed = False
 _green_streak = 0  # state_F()'s green-guard debounce counter
 
-# Per-state arm gate, not a per-transition one. Every freshly-entered
-# state (including F on the very first tick) starts unarmed -- paused,
-# not even ticked -- until one right-button press arms it. Once armed,
-# the state function runs every tick unattended and transitions happen
-# automatically the instant it returns a state letter; no further
-# button presses are needed for that. The new state then starts
-# unarmed again, same as any other entry.
+# Per-state arm gate, not a per-transition one. Only meaningful when
+# DEBUG_MODE is True: every freshly-entered state (including F on the
+# very first tick) starts unarmed -- paused, not even ticked -- until
+# one right-button press arms it. Once armed, the state function runs
+# every tick unattended and transitions happen automatically the instant
+# it returns a state letter; no further button presses are needed for
+# that. The new state then starts unarmed again, same as any other
+# entry. When DEBUG_MODE is False this is forced True every tick below,
+# so it never gates anything.
 armed = False
 
 while True:
     hub.display.char(state)
 
-    is_pressed = Button.RIGHT in hub.buttons.pressed()
-    if is_pressed and not was_pressed and not armed:
-        armed = True
-        print("armed: %s" % state)
-    was_pressed = is_pressed
+    if DEBUG_MODE:
+        is_pressed = Button.RIGHT in hub.buttons.pressed()
+        if is_pressed and not was_pressed and not armed:
+            armed = True
+            print("armed: %s" % state)
+        was_pressed = is_pressed
+    else:
+        armed = True  # no arm gate outside debug mode -- always run
 
     if armed:
         next_state = STATE_FUNCTIONS[state]()
         if next_state is not None:
             print("-> %s" % next_state)
             state = next_state
-            armed = False  # new state starts paused, waiting for its own press
+            armed = False  # debug mode: new state waits for its own
+                            # press; normal mode: overridden straight
+                            # back to True above on the very next tick
     else:
         robot.stop()  # paused: safe default, same reasoning as state_S()/state_H()
 
