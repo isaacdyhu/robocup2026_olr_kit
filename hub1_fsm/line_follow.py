@@ -34,6 +34,7 @@ Ports (confirmed against design.md's Hub 1 table, same hardware as
 pybricks/line_follow.py):
   A -- left inner colour sensor
   E -- right inner colour sensor
+  C -- ultrasonic distance sensor
   B -- left wheel motor
   F -- right wheel motor
 """
@@ -41,7 +42,7 @@ pybricks/line_follow.py):
 import math
 
 from pybricks.hubs import PrimeHub
-from pybricks.pupdevices import Motor, ColorSensor
+from pybricks.pupdevices import Motor, ColorSensor, UltrasonicSensor
 from pybricks.parameters import Port, Direction, Button
 from pybricks.robotics import DriveBase
 from pybricks.tools import wait
@@ -50,6 +51,8 @@ hub = PrimeHub()
 
 left_sensor = ColorSensor(Port.A)
 right_sensor = ColorSensor(Port.E)
+ultrasonic_sensor = UltrasonicSensor(Port.C)  # obstacle detection (design.md
+                                              # Sec4 guard 2 / Sec6 state O)
 
 # Confirmed direction for this hardware in pybricks/line_follow.py's
 # latest tested state -- reused here rather than re-guessed, since it's
@@ -320,6 +323,130 @@ def hunt_for_branch(pivot_offset_mm, turn_sign, far_sensor):
     right_motor.stop()
 
 
+# --- obstacle bypass (design.md Sec6 "Obstacle bypass (state O)") -----------
+#
+# Supersedes design.md's own written spec (a fixed 70deg/-200mm/-100deg
+# blind detour) with a different, explicitly-requested maneuver that
+# circles the obstacle -- the course's "water tower" -- using it as the
+# pivot itself, gyro-gated for accuracy rather than trusting blind wheel
+# rotation over what is a much longer turn than the green-turn pivot:
+#
+#   1. Record the current heading (hub.imu.heading()), then spin
+#      OBSTACLE_SPIN_DEG clockwise on the spot. Since the spin doesn't
+#      translate the robot, this points it tangentially past the tower,
+#      which is now assumed to be directly to its LEFT at
+#      OBSTACLE_PIVOT_RADIUS_MM -- a fixed assumed distance rather than
+#      the ultrasonic's live reading at trigger time, so the loop's
+#      radius doesn't depend on exactly where inside OBSTACLE_TRIGGER_MM
+#      the guard happened to fire.
+#   2. Pivot OBSTACLE_LOOP_DEG (half circle) with the assumed tower
+#      position as the pivot point -- pivot_offset =
+#      -OBSTACLE_PIVOT_RADIUS_MM. Because that offset is far beyond half
+#      the axle track, both wheels drive forward (at different rates),
+#      tracing a loop around the tower rather than reversing a wheel,
+#      and bring the robot out the other side, near the original line
+#      of travel, roughly facing back along it.
+#   3. NOT a blind return to the original heading -- drive straight
+#      ahead and hunt for the line with the inner-RIGHT sensor (the one
+#      now sweeping toward it after the loop), stopping the instant it
+#      reads black, or OBSTACLE_REJOIN_MAX_MM if it never does. This is
+#      the sensor-gated close-out moves 1-2's blind geometry can't
+#      guarantee by itself.
+#
+# Moves 1-2 share rotate_to_heading() below rather than run_pivot():
+# that one is open-loop (a fixed motor-angle command), fine for the
+# short green-turn pivot but not for a maneuver whose middle step is up
+# to a full 180-degree loop, where wheel slip would accumulate into a
+# real heading error. rotate_to_heading() runs continuously and stops
+# only once the gyro itself confirms the target heading.
+OBSTACLE_TRIGGER_MM = 200         # design.md's exact figure -- ultrasonic
+                                  # threshold for the F -> O guard
+OBSTACLE_SPIN_DEG = 60           # move 1: degrees to turn tangential to
+                                  # the tower
+OBSTACLE_LOOP_DEG = 110          # move 2: half-circle around the tower
+OBSTACLE_PIVOT_RADIUS_MM = 250   # move 2's pivot distance -- a fixed
+                                  # assumed clearance rather than the
+                                  # ultrasonic's live reading at trigger
+                                  # time, so the loop's radius doesn't
+                                  # depend on exactly where inside
+                                  # OBSTACLE_TRIGGER_MM the guard happened
+                                  # to fire.
+OBSTACLE_ROTATE_SPEED_DPS = 150  # deg/s for moves 1-2
+OBSTACLE_ROTATE_POLL_MS = 10     # gyro poll interval while rotating
+
+OBSTACLE_REJOIN_MAX_MM = 300     # move 3: give up and -> H if the line
+                                  # still hasn't been found after this
+                                  # much straight-line travel
+OBSTACLE_REJOIN_SPEED_MM_S = 60  # mm/s, straight-line speed for move 3
+OBSTACLE_REJOIN_POLL_MS = 5     # sensor-check interval while driving straight
+# All untested placeholders, same as every other numeric constant here.
+
+
+def drive_until_black(sensor, max_distance_mm, speed_mm_s):
+    """
+    Move 3's straight-line hunt: drive dead ahead (no curvature) until
+    `sensor` reads black or `max_distance_mm` of travel is used up,
+    whichever comes first. Returns True if the line was found, False if
+    the distance cap was hit first.
+
+    Distance is tracked as a difference of two robot.distance() readings,
+    never via robot.reset() -- design.md Sec10 forbids that, since other
+    states (and rotate_to_heading()'s own gyro baseline) store absolute
+    readings a reset would silently invalidate.
+    """
+    start_mm = robot.distance()
+    robot.drive(speed_mm_s, 0)
+    while True:
+        if is_black(sensor.hsv()):
+            robot.stop()
+            return True
+        if robot.distance() - start_mm >= max_distance_mm:
+            robot.stop()
+            return False
+        wait(OBSTACLE_REJOIN_POLL_MS)
+
+
+def rotate_to_heading(pivot_offset_mm, target_heading_deg, speed_dps):
+    """
+    Rotate about pivot_offset_mm (same signed convention as
+    pivot_wheel_angles()/run_pivot(): negative = left, positive = right,
+    0 = in-place spin) until hub.imu.heading() reaches target_heading_deg,
+    then stop -- closed-loop via the gyro rather than a blind run_angle()
+    command, since state O's rotations (up to a full 180-degree loop
+    around the tower) are long enough for wheel slip to accumulate real
+    heading error if left open-loop.
+
+    Never calls hub.imu.reset_heading() -- like robot.distance() in
+    hunt_for_branch(), this only ever reads the accumulated heading and
+    compares it against an externally-supplied absolute target, the same
+    "record and subtract, never reset" rule
+    design.md Sec10 states for odometry, extended here to the gyro.
+    """
+    half_track = AXLE_TRACK_MM / 2
+    r_left = pivot_offset_mm + half_track
+    r_right = pivot_offset_mm - half_track
+    max_abs_r = max(abs(r_left), abs(r_right))
+    if max_abs_r == 0:
+        return  # degenerate pivot -- nothing to do
+
+    turn_sign = 1 if target_heading_deg > hub.imu.heading() else -1
+    left_speed = turn_sign * speed_dps * r_left / max_abs_r
+    right_speed = turn_sign * speed_dps * r_right / max_abs_r
+
+    left_motor.run(left_speed)
+    right_motor.run(right_speed)
+
+    while True:
+        current = hub.imu.heading()
+        if (turn_sign > 0 and current >= target_heading_deg) or \
+           (turn_sign < 0 and current <= target_heading_deg):
+            break
+        wait(OBSTACLE_ROTATE_POLL_MS)
+
+    left_motor.stop()
+    right_motor.stop()
+
+
 # --- state functions ---------------------------------------------------------
 #
 # One function per state design.md defines. Each runs every tick while
@@ -364,9 +491,16 @@ def state_F():
         _green_streak = 0
         return "L" if left_green else "R"
 
+    # Guard 2: obstacle -> O (design.md Sec4 "Guard ordering within the
+    # loop"). state_O() re-reads the ultrasonic itself on entry rather
+    # than trusting this exact reading, so nothing needs to be stashed
+    # here beyond the transition itself.
+    if ultrasonic_sensor.distance() < OBSTACLE_TRIGGER_MM:
+        print("obstacle: detected within %d mm" % OBSTACLE_TRIGGER_MM)
+        return "O"
+
     # TODO guards, remaining, in this exact priority order (design.md
     # Sec4 "Guard ordering within the loop"):
-    #   2. obstacle           -> O
     #   3. both inner black   -> X
     #   4. line lost 200 mm   -> B
     return None
@@ -436,10 +570,46 @@ def state_R():
 
 
 def state_O():
-    """Obstacle bypass (design.md Sec6)."""
-    # TODO: fixed right-side detour. -> F (line reacquired) / H (max
-    # rejoin distance exceeded).
-    return None
+    """Obstacle bypass -- circle the water tower using it as the pivot,
+    gyro-gated (see this file's "obstacle bypass" section header for the
+    full derivation of why each step is signed the way it is)."""
+    # Cancel state_F()'s continuous drive() before taking direct motor
+    # control inside rotate_to_heading() -- same reasoning as
+    # state_L()/state_R().
+    robot.stop()
+
+    heading0 = hub.imu.heading()  # the orientation to return to at the end
+
+    # Move 1: spin clockwise on the spot. The robot hasn't translated, so
+    # this points it tangentially past the tower, which is now assumed to
+    # be directly to its LEFT at OBSTACLE_PIVOT_RADIUS_MM -- a fixed
+    # distance, not the ultrasonic's live reading at trigger time (see
+    # that constant's own comment for why).
+    rotate_to_heading(0, heading0 + OBSTACLE_SPIN_DEG, OBSTACLE_ROTATE_SPEED_DPS)
+
+    # Move 2: half-circle around the assumed tower position as the pivot
+    # (negative = left, at OBSTACLE_PIVOT_RADIUS_MM). The target heading
+    # SUBTRACTS OBSTACLE_LOOP_DEG rather than adding it: pivoting around
+    # a point on the robot's left, moving forward, curves the heading
+    # back the OTHER way (counterclockwise) relative to move 1's
+    # clockwise spin -- see this section's header comment for the full
+    # derivation. The net effect is the robot loops around the tower and
+    # comes out the other side, back on the original line of travel.
+    rotate_to_heading(-OBSTACLE_PIVOT_RADIUS_MM,
+                       heading0 + OBSTACLE_SPIN_DEG - OBSTACLE_LOOP_DEG,
+                       OBSTACLE_ROTATE_SPEED_DPS)
+
+    # Move 3: NOT a blind spin back to heading0 -- moves 1-2 are a fixed
+    # blind pivot, but closing out the maneuver is sensor-gated instead
+    # of trusting that geometry to have landed exactly back on the line.
+    # Drive straight and hunt with the inner-RIGHT sensor (the one now
+    # sweeping toward the line after the loop) until it reads black, or
+    # give up -> H if OBSTACLE_REJOIN_MAX_MM passes without finding it.
+    if drive_until_black(right_sensor, OBSTACLE_REJOIN_MAX_MM, OBSTACLE_REJOIN_SPEED_MM_S):
+        print("obstacle: line reacquired")
+        return "F"
+    print("obstacle: rejoin distance exceeded")
+    return "H"
 
 
 def state_B():
