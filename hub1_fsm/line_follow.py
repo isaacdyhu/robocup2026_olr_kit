@@ -76,10 +76,10 @@ robot = DriveBase(left_motor, right_motor, WHEEL_DIAMETER_MM, AXLE_TRACK_MM)
 # normalise() step is needed the way design.md's real calibrated version
 # has one; that 30s white/black calibration window (Sec6.1.2) isn't
 # implemented here yet.
-V_MAX = 70        # mm/s, speed at error ~= 0
+V_MAX = 60        # mm/s, speed at error ~= 0
 V_MIN = 10         # mm/s, speed at or beyond ERROR_FULL
 ERROR_FULL = 60    # error magnitude at which speed reaches V_MIN
-STEER_GAIN = 0.04  # deg/mm of curvature per unit of error
+STEER_GAIN = 0.08  # deg/mm of curvature per unit of error
 TURN_MAX = 300     # deg/s, clamp
 
 # --- tunables: green marker detection (design.md Sec6) ----------------------
