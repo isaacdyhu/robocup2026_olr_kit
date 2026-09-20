@@ -46,6 +46,7 @@ from pybricks.pupdevices import Motor, ColorSensor, UltrasonicSensor
 from pybricks.parameters import Port, Direction, Button
 from pybricks.robotics import DriveBase
 from pybricks.tools import wait
+from pybricks.iodevices import PUPDevice
 
 hub = PrimeHub()
 
@@ -389,6 +390,19 @@ OBSTACLE_PIVOT_RADIUS_MM = 200   # move 2's pivot distance -- a fixed
 OBSTACLE_ROTATE_SPEED_DPS = 150  # deg/s for moves 1-2
 OBSTACLE_ROTATE_POLL_MS = 10     # gyro poll interval while rotating
 
+ROTATE_SLOWDOWN_MARGIN_DEG = 15  # once rotate_to_heading() is this close
+                                  # to its target, it drops to
+                                  # ROTATE_CREEP_SPEED_DPS rather than
+                                  # stopping abruptly from full speed --
+                                  # motor momentum plus this loop's own
+                                  # OBSTACLE_ROTATE_POLL_MS polling gap
+                                  # both add real overshoot past the
+                                  # target otherwise, worse the longer/
+                                  # faster the rotation was (exactly what
+                                  # overshot the -90 scan step). Untested
+                                  # placeholder.
+ROTATE_CREEP_SPEED_DPS = 30      # deg/s during that final approach
+
 OBSTACLE_REJOIN_MAX_MM = 300     # move 3: give up and -> H if the line
                                   # still hasn't been found after this
                                   # much straight-line travel
@@ -436,6 +450,12 @@ def rotate_to_heading(pivot_offset_mm, target_heading_deg, speed_dps):
     compares it against an externally-supplied absolute target, the same
     "record and subtract, never reset" rule
     design.md Sec10 states for odometry, extended here to the gyro.
+
+    Slows to ROTATE_CREEP_SPEED_DPS for the final ROTATE_SLOWDOWN_MARGIN_DEG
+    of the turn rather than braking abruptly from full speed the instant
+    the target is reached -- motor momentum plus this loop's own
+    OBSTACLE_ROTATE_POLL_MS polling gap both add real overshoot past the
+    target otherwise, worse the longer/faster the rotation was.
     """
     half_track = AXLE_TRACK_MM / 2
     r_left = pivot_offset_mm + half_track
@@ -445,17 +465,24 @@ def rotate_to_heading(pivot_offset_mm, target_heading_deg, speed_dps):
         return  # degenerate pivot -- nothing to do
 
     turn_sign = 1 if target_heading_deg > hub.imu.heading() else -1
-    left_speed = turn_sign * speed_dps * r_left / max_abs_r
-    right_speed = turn_sign * speed_dps * r_right / max_abs_r
 
-    left_motor.run(left_speed)
-    right_motor.run(right_speed)
+    def _set_speed(magnitude):
+        left_motor.run(turn_sign * magnitude * r_left / max_abs_r)
+        right_motor.run(turn_sign * magnitude * r_right / max_abs_r)
+
+    _set_speed(speed_dps)
+    slowed = False
 
     while True:
         current = hub.imu.heading()
         if (turn_sign > 0 and current >= target_heading_deg) or \
            (turn_sign < 0 and current <= target_heading_deg):
             break
+
+        if not slowed and abs(target_heading_deg - current) <= ROTATE_SLOWDOWN_MARGIN_DEG:
+            _set_speed(ROTATE_CREEP_SPEED_DPS)
+            slowed = True
+
         wait(OBSTACLE_ROTATE_POLL_MS)
 
     left_motor.stop()
@@ -683,7 +710,7 @@ def state_O():
     return "H"
 
 
-ZONE_BACKUP_MM = 300           # move backward this far once B decides
+ZONE_BACKUP_MM = LINE_LOST_MM-100           # move backward this far once B decides
                                # the line is genuinely gone, before
                                # flagging zone mode active. Untested
                                # placeholder.
@@ -693,29 +720,28 @@ ZONE_BACKUP_SPEED_MM_S = 60    # mm/s for the backup move -- applied via
 
 
 def state_B():
-    """Zone check (design.md Sec6) -- simplified: just recognise that the
-    line is genuinely gone (guard 4 already confirmed both-white for
-    LINE_LOST_MM) and flag zone mode active, without doing anything with
-    that yet. Design.md's fuller spec -- raise the camera, spin 360
-    scanning for zone targets, dispatch to F/A/V/H -- is not implemented;
-    there's nowhere further to go yet, so this only ever stays in B."""
+    """Zone check (design.md Sec6) -- simplified: recognise that the line
+    is genuinely gone (guard 4 already confirmed both-white for
+    LINE_LOST_MM), back up a fixed distance, flag zone mode active, then
+    hand off to V. Design.md's fuller spec -- raise the camera, spin 360
+    scanning for zone targets, dispatch to F/A/V/H depending on what's
+    found -- is not implemented; this always assumes case d (zone
+    confirmed, survey next) and goes straight to V."""
     global _zone_mode_active
-
-    if _zone_mode_active:
-        robot.stop()  # already activated -- idle, nothing further
-                       # implemented yet (see docstring)
-        return None
 
     # Cancel state_F()'s continuous drive() before the blocking
     # straight() move below -- same reasoning as every other state that
-    # takes direct/blocking control.
+    # takes direct/blocking control. No one-shot re-entry guard needed
+    # here (unlike state_O()'s multi-tick equivalents once did) -- B now
+    # always finishes by transitioning straight to V in the same call,
+    # so it's never invoked again afterward to repeat the backup.
     robot.stop()
     robot.settings(straight_speed=ZONE_BACKUP_SPEED_MM_S)
     robot.straight(-ZONE_BACKUP_MM)  # negative = backward
 
     _zone_mode_active = True
-    print("zone: mode activated")
-    return None
+    print("zone: mode activated, reversing complete -> V")
+    return "V"
 
 
 def state_H():
@@ -726,9 +752,386 @@ def state_H():
     return None
 
 
+# --- hub <-> camera link (PUPRemote), for state V's zone survey -------------
+#
+# Not needed by anything before this point in the file -- F/O/X/B never
+# talk to the camera -- so it's introduced here rather than up top with
+# the other hardware, right before the one state that actually uses it.
+#
+# Vendored from github.com/antonvh/PUPRemote (pupremote_hub.py, GPL),
+# same class pybricks/hub_camera_test.py already carries and already
+# confirmed end-to-end against real hardware -- copied in again here
+# rather than imported, for the same reason that file gives: stable
+# code.pybricks.com doesn't support Pybricks Code Beta's cross-file
+# auto-bundling, so a plain `from pupremote_hub import PUPRemoteHub`
+# would fail. Includes the self.port fix already applied to that copy
+# (confirmed as a genuine upstream bug, not a vendoring mistake) -- see
+# pybricks/hub_camera_test.py's own comment on it for the full story.
+import ustruct as struct
+from pybricks.tools import run_task
+from micropython import const
+
+_MAX_PKT = const(16)
+
+_NAME = const(0)
+_SIZE = const(1)
+_TO_HUB_FORMAT = const(2)
+_FROM_HUB_FORMAT = const(3)
+_ARGS_TO_HUB = const(5)
+_ARGS_FROM_HUB = const(6)
+_CALLBACK = const(0)
+
+
+class _PUPRemote:
+    def __init__(self, max_packet_size=_MAX_PKT):
+        self.commands = []
+        self.modes = {}
+        self.max_packet_size = max_packet_size
+
+    def add_command(self, mode_name, to_hub_fmt="", from_hub_fmt="", command_type=_CALLBACK):
+        if to_hub_fmt == "repr" or from_hub_fmt == "repr":
+            msg_size = self.max_packet_size
+            num_args_from_hub = -1
+            num_args_to_hub = -1
+        else:
+            size_to_hub_fmt = struct.calcsize(to_hub_fmt)
+            size_from_hub_fmt = struct.calcsize(from_hub_fmt)
+            msg_size = max(size_to_hub_fmt, size_from_hub_fmt)
+            num_args_to_hub = len(
+                struct.unpack(to_hub_fmt, bytearray(struct.calcsize(to_hub_fmt)))
+            )
+            num_args_from_hub = len(
+                struct.unpack(from_hub_fmt, bytearray(struct.calcsize(from_hub_fmt)))
+            )
+
+        assert msg_size <= self.max_packet_size, "Payload exceeds maximum packet size"
+        self.commands.append({
+            _NAME: mode_name,
+            _TO_HUB_FORMAT: to_hub_fmt,
+            _SIZE: msg_size,
+            _ARGS_TO_HUB: num_args_to_hub,
+        })
+        if command_type == _CALLBACK:
+            self.commands[-1][_FROM_HUB_FORMAT] = from_hub_fmt
+            self.commands[-1][_ARGS_FROM_HUB] = num_args_from_hub
+
+        self.modes[mode_name] = len(self.commands) - 1
+
+    def decode(self, fmt, data):
+        if fmt == "repr":
+            clean = data.rstrip(b"\x00")
+            return (eval(clean),) if clean else ("",)
+        else:
+            size = struct.calcsize(fmt)
+            data = struct.unpack(fmt, data[:size])
+        return data
+
+    def encode(self, size, format, *argv):
+        if format == "repr":
+            s = bytes(repr(*argv), "UTF-8")
+        else:
+            s = struct.pack(format, *argv)
+        assert len(s) <= size, "Payload exceeds maximum packet size"
+        return s
+
+
+class _PUPRemoteHub(_PUPRemote):
+    def __init__(self, port, max_packet_size=_MAX_PKT):
+        super().__init__(max_packet_size)
+        if isinstance(port, str):
+            port = eval("Port." + port)
+        elif isinstance(port, int):
+            port = eval("Port." + chr(64 + port))
+        self.port = port
+        try:
+            self.pup_device = PUPDevice(port)
+        except OSError:
+            self.pup_device = None
+            print("Check wiring and remote script. Unable to connect on ", self.port)
+            raise
+
+    def add_command(self, mode_name, to_hub_fmt="", from_hub_fmt="", command_type=_CALLBACK):
+        super().add_command(mode_name, to_hub_fmt, from_hub_fmt, command_type)
+        modes = self.pup_device.info()["modes"]
+        n = len(self.commands) - 1
+        assert len(self.commands) <= len(modes), "More commands than on remote side"
+        assert mode_name == modes[n][0].rstrip(), (
+            "Expected '{}' as mode {}, but got '{}'".format(modes[n][0].rstrip(), n, mode_name)
+        )
+        assert self.commands[-1][_SIZE] == modes[n][1], (
+            "Different parameter size than on remote side. Check formats."
+        )
+
+    def call(self, mode_name, *argv, wait_ms=0):
+        assert not run_task(), "Use 'call_multitask' instead of 'call', with multiple start blocks or multitask blocks"
+
+        mode = self.modes[mode_name]
+        size = self.commands[mode][_SIZE]
+
+        if _FROM_HUB_FORMAT in self.commands[mode]:
+            num_args = self.commands[mode][_ARGS_FROM_HUB]
+            if num_args >= 0:
+                assert len(argv) == num_args, (
+                    "Expected {} argument(s) in call '{}'".format(num_args, mode_name)
+                )
+            self.pup_device.read(mode)
+            payl = self.encode(size, self.commands[mode][_FROM_HUB_FORMAT], *argv)
+            self.pup_device.write(
+                mode,
+                [((i + 128) & 0xFF) - 128 for i in tuple(payl + b"\x00" * (size - len(payl)))],
+            )
+            wait(wait_ms)
+
+        data = self.pup_device.read(mode)
+        raw_data = bytes([b if b >= 0 else b + 256 for b in data])
+        result = self.decode(self.commands[mode][_TO_HUB_FORMAT], raw_data)
+        return result[0] if len(result) == 1 else result
+
+
+# to_hub_fmt/from_hub_fmt must match camera.py's add_command("mode", ...)
+# exactly, and this project's own hub_camera_test.py already confirmed
+# them end-to-end. ZONE (echoed_mode=1) reply fields, per camera.py's own
+# comment above its "mode" registration:
+#   count, kind, bearing_deg, dist_mm, green_found, red_found
+# kind: -1 = no sphere, 0 = dead, 1 = live.
+camera = _PUPRemoteHub(Port.D)
+camera.add_command("mode", to_hub_fmt="hhhhhhhh", from_hub_fmt="b")
+
+
+# --- zone survey (design.md Sec7 "SURVEY (state V)") -------------------------
+#
+# A staggered (step-and-check, not continuous) rotation scan: pivot in
+# SCAN_ANGLES_DEG's fixed 30-degree increments from -90 to +90 relative
+# to the heading the robot had on entering V, checking the camera for a
+# sphere after each step, and stopping the instant one is found --
+# dead or alive, either counts (design.md's own kind distinction is for
+# a later state to act on, not for V to filter here).
+SCAN_ANGLES_DEG = [-70, -60, -30, 0, 30, 60, 70]
+SCAN_ROTATE_SPEED_DPS = 100     # deg/s for each pivot step and the final
+                                # bearing-centring correction
+
+# The camera doesn't switch into ZONE mode instantly -- it needs a frame
+# or two after the "mode" command lands (pybricks/hub_camera_test.py's
+# own "(switching...)" comment describes the same lag) -- so both of the
+# retry loops below resend/re-check rather than trusting a single call.
+SCAN_MODE_SWITCH_RETRIES = 20   # attempts to confirm ZONE mode before
+                                # the scan itself starts
+SCAN_MODE_SWITCH_POLL_MS = 50
+SCAN_SETTLE_MS = 1500            # pause after each pivot, before querying,
+                                # so the camera grabs a frame at the new heading
+SCAN_QUERY_RETRIES = 5          # per-angle attempts to get a fresh ZONE reply
+SCAN_QUERY_POLL_MS = 50
+# All untested placeholders, same as every other numeric constant here.
+
+
+def query_zone_camera():
+    """
+    Ask the camera for its current ZONE-mode reading, retrying up to
+    SCAN_QUERY_RETRIES times if echoed_mode hasn't caught up to ZONE yet
+    (see this section's header comment on why that lag is expected, not
+    a bug). Returns (count, kind, bearing_deg, dist_mm, green_found,
+    red_found), or None if the camera never confirmed ZONE mode within
+    the retry budget.
+    """
+    for _ in range(SCAN_QUERY_RETRIES):
+        echoed_mode, heartbeat, f2, f3, f4, f5, f6, f7 = camera.call("mode", 1, wait_ms=5)
+        if echoed_mode == 1:
+            return f2, f3, f4, f5, f6, f7
+        wait(SCAN_QUERY_POLL_MS)
+    return None
+
+
+# --- closing the loop on bearing ---------------------------------------------
+#
+# One continuous slow rotation toward the ball, watching the bearing as it
+# goes and stopping when it reaches zero -- rather than the scan's old
+# one-shot "pivot by whatever bearing was measured once" correction, which
+# was only ever as good as ONE stale reading times ONE imperfect pivot.
+#
+# Closing the loop is insensitive to error in both, and -- the part that
+# really matters here -- to SCALE error in the bearing itself.
+# CAMERA_HFOV_DEG (camera.py) is still an unmeasured placeholder, so if
+# it's off by 20%, every bearing read here is off by 20%. A one-shot
+# correction inherits that directly; this still stops in the right place,
+# because only the bearing's SIGN has to be right for it to work.
+CENTRE_TOLERANCE_DEG = 7      # |bearing| at or below this counts as centred
+
+CENTRE_ROTATE_SPEED_DPS = 10  # deliberately SLOW, and the single most
+                              # important constant here. Unlike a
+                              # stop-and-measure loop, this one measures
+                              # while moving, so every reading is stale by
+                              # one camera frame plus one link round-trip
+                              # -- call it 100-200ms in ZONE mode, where
+                              # the blob work is heavy. The robot keeps
+                              # turning through that whole delay, so
+                              # overshoot is roughly
+                              #     speed x latency
+                              # (20 deg/s x 0.15 s = 3 deg, inside the
+                              # tolerance band above). IF IT OVERSHOOTS,
+                              # LOWER THIS -- do not tighten
+                              # CENTRE_TOLERANCE_DEG, which makes it worse
+                              # by narrowing the band the robot has to
+                              # catch while sailing past at the same rate.
+CENTRE_MAX_SWEEP_DEG = 90     # safety cap on total rotation: give up
+                              # rather than spin forever if the bearing
+                              # never reaches zero (ball rolled out of
+                              # frame, bearing sign convention inverted,
+                              # camera stuck on a stale frame)
+
+
+def centre_on_ball():
+    """
+    Turn slowly toward the ball in one continuous motion, polling the
+    camera throughout, and stop once it reports the ball within
+    CENTRE_TOLERANCE_DEG of dead ahead.
+
+    Two stop conditions, not one. The obvious one is the bearing landing
+    inside the tolerance band. The second is the bearing CHANGING SIGN
+    between two polls -- that means the ball crossed dead-ahead somewhere
+    in the gap between those readings, and without catching it the robot
+    would carry on turning away from a ball it has already passed. With
+    stale readings and a finite poll rate, that case is not an edge case;
+    it is what happens whenever the band is crossed faster than it is
+    sampled.
+
+    Returns True once centred (either way), False if the ball was lost,
+    the camera stopped answering, or the sweep cap was hit.
+    """
+    result = query_zone_camera()
+    if result is None:
+        print("centre: camera not responding")
+        return False
+
+    count, kind, bearing, dist, green_found, red_found = result
+    if kind == -1:
+        print("centre: no ball to centre on")
+        return False
+
+    if abs(bearing) <= CENTRE_TOLERANCE_DEG:
+        print("centre: already centred at bearing %d" % bearing)
+        return True
+
+    # Positive bearing = ball right of centre -> turn right (clockwise),
+    # which is +1 in this file's convention throughout. The wheel speeds
+    # below are just rotate_to_heading()'s own in-place-spin case
+    # (pivot_offset 0) written out directly: left forward, right back.
+    turn_sign = 1 if bearing > 0 else -1
+    start_heading = hub.imu.heading()
+    print("centre: bearing %d, turning %s" %
+          (bearing, "right" if turn_sign > 0 else "left"))
+
+    left_motor.run(turn_sign * CENTRE_ROTATE_SPEED_DPS)
+    right_motor.run(-turn_sign * CENTRE_ROTATE_SPEED_DPS)
+
+    while True:
+        if abs(hub.imu.heading() - start_heading) >= CENTRE_MAX_SWEEP_DEG:
+            left_motor.stop()
+            right_motor.stop()
+            print("centre: swept %d deg without centring, giving up" %
+                  CENTRE_MAX_SWEEP_DEG)
+            return False
+
+        # No explicit wait between polls: query_zone_camera() already
+        # costs a link round-trip, and every millisecond added here is
+        # another millisecond of rotation the reading doesn't know about.
+        result = query_zone_camera()
+        if result is None:
+            left_motor.stop()
+            right_motor.stop()
+            print("centre: camera stopped responding mid-turn")
+            return False
+
+        count, kind, bearing, dist, green_found, red_found = result
+
+        if kind == -1:
+            left_motor.stop()
+            right_motor.stop()
+            print("centre: ball lost mid-turn")
+            return False
+
+        if abs(bearing) <= CENTRE_TOLERANCE_DEG:
+            left_motor.stop()
+            right_motor.stop()
+            print("centre: centred at bearing %d" % bearing)
+            return True
+
+        if (bearing > 0) != (turn_sign > 0):
+            # Sign flipped: the ball crossed dead-ahead between polls.
+            # Stop now -- still turning would walk away from it. The
+            # printed bearing is how far past centre it got, which is the
+            # number to watch if CENTRE_ROTATE_SPEED_DPS needs lowering.
+            left_motor.stop()
+            right_motor.stop()
+            print("centre: passed centre, stopped at bearing %d" % bearing)
+            return True
+
+
 def state_V():
-    """SURVEY (design.md Sec7)."""
-    # TODO -> A (sphere known) / K (none left, or time short) / Q (scan failed)
+    """SURVEY (design.md Sec7) -- staggered rotation scan for a sphere,
+    then centre on its reported bearing before handing off to A."""
+    # Cancel state_F()'s continuous drive() before taking direct motor
+    # control inside rotate_to_heading() -- same reasoning as every
+    # other state that takes over the motors directly.
+    robot.stop()
+
+    # Make sure the camera is actually in ZONE mode before scanning --
+    # state_B() only flags zone mode locally, it doesn't yet tell the
+    # camera itself to switch (out of scope to add there right now), so
+    # it's confirmed here instead, once, before the scan begins.
+    for _ in range(SCAN_MODE_SWITCH_RETRIES):
+        echoed_mode = camera.call("mode", 1, wait_ms=5)[0]
+        if echoed_mode == 1:
+            wait(SCAN_SETTLE_MS)
+            break
+        wait(SCAN_MODE_SWITCH_POLL_MS)
+    else:
+        print("survey: camera never confirmed ZONE mode, scanning anyway")
+
+    heading0 = hub.imu.heading()  # scan angles below are relative to this
+
+    for angle in SCAN_ANGLES_DEG:
+        rotate_to_heading(0, heading0 + angle, SCAN_ROTATE_SPEED_DPS)
+
+        # Diagnostic: requested vs actually-reached heading (relative to
+        # heading0), so a mismatch between the two is visible directly
+        # rather than inferred from robot behaviour alone. actual should
+        # match angle closely (within ROTATE_SLOWDOWN_MARGIN_DEG-ish); a
+        # large or systematic gap here points at rotate_to_heading()
+        # itself (or the gyro/motors), not at this loop or SCAN_ANGLES_DEG.
+        actual = hub.imu.heading() - heading0
+        print("survey: requested %d deg, actual %d deg" % (angle, actual))
+
+        wait(SCAN_SETTLE_MS)  # let the camera grab a fresh frame at this heading
+
+        result = query_zone_camera()
+        if result is None:
+            print("survey: camera not responding at %d deg" % angle)
+            continue
+
+        count, kind, bearing, dist, green_found, red_found = result
+        print("survey: camera says count=%d kind=%d bearing=%d dist=%d green=%s red=%s" %
+              (count, kind, bearing, dist,
+               "y" if green_found else "n", "y" if red_found else "n"))
+
+        if kind != -1:  # a sphere was found -- dead or alive both count
+            print("survey: sphere found at scan angle %d (kind=%d bearing=%d dist=%d)" %
+                  (angle, kind, bearing, dist))
+
+            if centre_on_ball():
+                print("survey: centred, heading %d deg relative to entry" %
+                      (hub.imu.heading() - heading0))
+                return "A"
+
+            # Couldn't lock on -- ball lost mid-correction, or the bearing
+            # never converged. Carry on scanning from the next angle
+            # rather than handing A a target that isn't there; the scan's
+            # own targets are absolute (heading0 + angle), so whatever
+            # rotation centring already did doesn't throw the rest off.
+            print("survey: centring failed, resuming scan")
+
+    print("survey: no sphere found after full scan")
+    # TODO -> K (none left, or time short) / Q (scan failed) per
+    # design.md Sec7 -- neither implemented yet, so this just stays in V.
     return None
 
 
@@ -780,6 +1183,26 @@ STATE_FUNCTIONS = {
     "K": state_K, "Q": state_Q,
 }
 
+# design.md Sec7's zone states -- everything else (line-following and its
+# own guards/turns/bypasses) is a "line" state, where the camera should
+# be tilted down in LINE mode (design.md Sec4/5), not left in whatever
+# mode state_V()'s own scan last put it in.
+ZONE_STATES = {"V", "A", "C", "D", "T", "K", "Q"}
+
+
+def sync_camera_line_mode():
+    """
+    Tell the camera to switch to LINE mode (tilts it back down). Called
+    once at the moment the FSM crosses from a zone state back into a
+    line state, not every tick -- state_F()'s own loop runs far too
+    often to afford a blocking camera.call() on every 10ms tick, unlike
+    state_V()'s own zone-mode entry, which can afford to retry-until-
+    confirmed because it only happens once per zone attempt. This is
+    just restoring the default/safe camera orientation for line-
+    following, so a single best-effort send is accepted here instead.
+    """
+    camera.call("mode", 0, wait_ms=5)
+
 # --- debug-stepped main loop -------------------------------------------------
 
 # Master switch for the whole arm-gate mechanism this file's header
@@ -790,7 +1213,7 @@ STATE_FUNCTIONS = {
 # instant it's entered, and transitions chain straight into each other
 # with no button presses at all. Flip this and reflash; it isn't wired
 # to a live button, so it can't be changed without stopping the program.
-DEBUG_MODE = False
+DEBUG_MODE = True
 
 state = "F"  # starts directly in F rather than S, since S's real
              # start-button wait isn't implemented yet either
@@ -812,6 +1235,12 @@ _zone_mode_active = False  # state_B()'s one-shot entry guard -- True
 # so it never gates anything.
 armed = False
 
+# F is the very first state, with no transition into it for the
+# ZONE_STATES check below to hook -- synced explicitly here instead,
+# once, so the camera starts in LINE mode regardless of whatever mode it
+# was left in by a previous run or test.
+sync_camera_line_mode()
+
 while True:
     hub.display.char(state)
 
@@ -828,6 +1257,9 @@ while True:
         next_state = STATE_FUNCTIONS[state]()
         if next_state is not None:
             print("-> %s" % next_state)
+            if state in ZONE_STATES and next_state not in ZONE_STATES:
+                sync_camera_line_mode()  # crossing back from a zone
+                                          # state into a line state
             state = next_state
             armed = False  # debug mode: new state waits for its own
                             # press; normal mode: overridden straight

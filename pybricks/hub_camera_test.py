@@ -125,12 +125,24 @@ class PUPRemoteHub(PUPRemote):
 
     def __init__(self, port, max_packet_size=MAX_PKT):
         super().__init__(max_packet_size)
+        # Upstream bug fixed here, confirmed against the real source
+        # (github.com/antonvh/PUPRemote's pupremote_hub.py) -- it has
+        # this exact same "if str / if int-else" structure, which only
+        # ever sets self.port in the else branch. Called with a string
+        # ("D") or a raw int (4) instead of Port.D directly, self.port
+        # would stay unset, and the except block below would throw its
+        # own AttributeError trying to print it -- masking the real
+        # OSError entirely. Not the cause of this file's actual "not
+        # connected" error (this script always calls PUPRemoteHub with
+        # Port.D directly, which isn't a str or an int, so self.port was
+        # already being set correctly on that specific path) -- fixed
+        # anyway since it's latent and this class may get reused
+        # elsewhere with a different-typed port argument.
         if isinstance(port, str):
             port = eval("Port." + port)
-        if isinstance(port, int):
+        elif isinstance(port, int):
             port = eval("Port." + chr(64 + port))
-        else:
-            self.port = port
+        self.port = port
         try:
             self.pup_device = PUPDevice(port)
         except OSError:

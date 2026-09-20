@@ -98,7 +98,7 @@ def set_tilt(angle_deg, time_ms=0):
 # same as before the hub link existed. Once Hub 1 calls the "mode"
 # command (see the PUPRemote section below), `zone_mode` is what actually
 # drives the main loop, kept up to date by that command's callback.
-ZONE_MODE_ENABLED = False
+ZONE_MODE_ENABLED = True
 zone_mode = ZONE_MODE_ENABLED
 
 # --- hub link (PUPRemote) -----------------------------------------------
@@ -262,14 +262,14 @@ ZONE_BRIGHTNESS_FRACTION = 1.3
 
 # Evacuation-point corners are real, saturated colours (LAB: L, A, B each
 # min/max). UNTESTED PLACEHOLDERS -- tune against the real triangles.
-GREEN_THRESHOLD = (0, 80, -80, -10, 0, 60)
-RED_THRESHOLD = (0, 80, 20, 80, 0, 60)
+GREEN_THRESHOLD = (10, 70, -60, -15, 5, 45)
+RED_THRESHOLD = (15, 45, 25, 70, 10, 55)
 
 # Triangles are ~280 mm -- much bigger than the 39.6 mm course markers, so
 # filter harder for noise. This also sidesteps design.md's green-marker-vs-
 # triangle ambiguity in state B: ZONE mode here only ever runs because the
 # manual switch says so, never because a course marker was mistaken for it.
-ZONE_MIN_BLOB_PIXELS = 100
+ZONE_MIN_BLOB_PIXELS = 800
 
 # find_circles' Hough-style vote threshold -- higher is stricter.
 # Confirmed working at 2500: dead ball found as a single, sharply-defined
@@ -307,7 +307,33 @@ CAMERA_TILT_DEG = 30      # angle of the optical axis below horizontal;
                           # 0 = looking at the horizon, 90 = straight down
 CAMERA_VFOV_DEG = 45      # vertical field of view of the CURRENT frame --
                           # depends on the lens and on ZONE_WINDOW_H_FRAC,
-                          # so recalibrate this if that fraction changes
+                          # so recalibrate this if that fraction changes.
+                          # Used by estimate_distance_mm() only.
+CAMERA_HFOV_DEG = 58      # horizontal field of view of the CURRENT frame,
+                          # used by estimate_bearing_deg() only.
+                          #
+                          # Strictly speaking this is derivable from
+                          # CAMERA_VFOV_DEG: with square pixels and a
+                          # rectilinear lens there is ONE focal length, so
+                          # 45 deg over 240 rows implies
+                          # 2*atan(160/(120/tan(22.5))) = 57.8 deg over 320
+                          # columns -- which is where this 58 comes from, so
+                          # it starts out behaving identically to the old
+                          # shared-focal-length code.
+                          #
+                          # It gets its own constant anyway, for two
+                          # practical reasons. First, CAMERA_VFOV_DEG is an
+                          # unverified placeholder, and deriving bearing
+                          # from it means every error in that guess feeds
+                          # straight into bearing; measuring this one
+                          # directly makes bearing independent of it.
+                          # Second, the square-pixel/rectilinear assumption
+                          # is exactly that -- an assumption. Any barrel
+                          # distortion in the real lens breaks the clean
+                          # atan relationship between the two axes, and
+                          # then only a directly-measured horizontal figure
+                          # is right. See estimate_bearing_deg() for how to
+                          # measure it.
 
 # 0-255 luma; a point sampled darker than this counts as "dark" when
 # classify_sphere() below grids the circle's face -- shape already told
@@ -630,18 +656,31 @@ def find_textured_spheres(img, existing):
     return accepted
 
 
-def _focal_px(img):
+def _focal_px_v(img):
     """
-    Focal length in pixels, derived from CAMERA_VFOV_DEG and the current
-    frame height. Shared by the distance and bearing calculations below:
-    a sensor with square pixels (the normal case for a machine-vision
-    sensor like this one) has one physical focal length that converts to
-    the same pixel-focal-length on both axes, so this same value is valid
-    for the horizontal axis too -- no separate horizontal-FOV constant
-    needed.
+    Focal length in pixels on the VERTICAL axis, from CAMERA_VFOV_DEG and
+    the current frame height. Used by estimate_distance_mm(), which
+    projects rows.
     """
     half_h_px = img.height() / 2
     return half_h_px / math.tan(math.radians(CAMERA_VFOV_DEG / 2))
+
+
+def _focal_px_h(img):
+    """
+    Focal length in pixels on the HORIZONTAL axis, from CAMERA_HFOV_DEG
+    and the current frame width. Used by estimate_bearing_deg(), which
+    projects columns.
+
+    Kept separate from _focal_px_v() rather than sharing one value: with
+    square pixels and a rectilinear lens the two are the same number, but
+    splitting them lets the horizontal axis be calibrated directly
+    against reality instead of inheriting CAMERA_VFOV_DEG's error, and
+    survives a lens whose distortion breaks that equality. See
+    CAMERA_HFOV_DEG's own comment for the full reasoning.
+    """
+    half_w_px = img.width() / 2
+    return half_w_px / math.tan(math.radians(CAMERA_HFOV_DEG / 2))
 
 
 def estimate_distance_mm(img, cy, r):
@@ -660,7 +699,7 @@ def estimate_distance_mm(img, cy, r):
     zero/negative-tangent guard costs nothing).
     """
     base_row = cy + r
-    focal_px = _focal_px(img)
+    focal_px = _focal_px_v(img)  # rows -> vertical axis
     half_h_px = img.height() / 2
 
     dy_px = base_row - half_h_px  # positive = below frame centre
@@ -677,10 +716,21 @@ def estimate_bearing_deg(img, cx):
     Horizontal angle of a detected object from the centre of the frame,
     in degrees. Positive = right of centre, negative = left -- this is
     the "bearing" design.md's ZONE mode reply format calls for (Sec3).
+
+    Accuracy here rests entirely on CAMERA_HFOV_DEG, so measure it rather
+    than trusting the derived-from-vertical default: point the camera
+    square at a wall from a tape-measured distance D, mark on the wall
+    where the extreme left and right edges of the frame fall, measure the
+    width W between those marks, then
+        CAMERA_HFOV_DEG = 2 * degrees(atan((W / 2) / D))
+    A wall at D = 500 mm showing W = 553 mm, for instance, is the 58 deg
+    the constant currently assumes. If the measured figure comes out
+    meaningfully different, that difference was previously being absorbed
+    silently into every bearing this returned.
     """
     half_w_px = img.width() / 2
     dx_px = cx - half_w_px
-    return math.degrees(math.atan(dx_px / _focal_px(img)))
+    return math.degrees(math.atan(dx_px / _focal_px_h(img)))
 
 
 def find_spheres(img):
