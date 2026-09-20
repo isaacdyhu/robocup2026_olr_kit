@@ -85,6 +85,11 @@ ERROR_FULL = 60    # error magnitude at which speed reaches V_MIN
 STEER_GAIN = 0.09  # deg/mm of curvature per unit of error
 TURN_MAX = 300     # deg/s, clamp
 
+LINE_LOST_MM = 300  # mm of continuous both-white travel before guard 4
+                    # (-> B) fires. design.md's own figure is ~200mm;
+                    # set to 300 here per this project's own spec.
+                    # Untested placeholder.
+
 # --- tunables: green marker detection (design.md Sec6) ----------------------
 #
 # Hue window plus saturation/value floors -- rejects black, white and
@@ -264,9 +269,19 @@ BLACK_VAL_MAX = 20  # hsv().v at/below this reads as "on the black line".
                     # shortcut follow_line() uses, no calibrated
                     # white/black window yet (design.md Sec6.1.2).
 
+WHITE_VAL_MIN = 70  # hsv().v at/above this reads as "on white/background".
+                    # A genuine positive test for white, not just "not
+                    # black" -- a grey in-between reading counts as
+                    # neither, same untested-placeholder caveat as
+                    # BLACK_VAL_MAX.
+
 
 def is_black(hsv):
     return hsv.v <= BLACK_VAL_MAX
+
+
+def is_white(hsv):
+    return hsv.v >= WHITE_VAL_MIN
 
 
 def hunt_for_branch(pivot_offset_mm, turn_sign, far_sensor):
@@ -466,7 +481,7 @@ def state_S():
 
 def state_F():
     """Follow black line (design.md Sec4)."""
-    global _green_streak
+    global _green_streak, _line_lost_start_mm
 
     l_hsv, r_hsv = read_sensors()  # one hsv() per sensor per tick,
                                    # reused below for the green guard
@@ -506,9 +521,26 @@ def state_F():
     if is_black(l_hsv) and is_black(r_hsv):
         return "X"
 
-    # TODO guard, remaining, in this exact priority order (design.md
-    # Sec4 "Guard ordering within the loop"):
-    #   4. line lost 200 mm   -> B
+    # Guard 4, lowest priority: both inner sensors white, continuously,
+    # for LINE_LOST_MM of travel -> B (design.md Sec4 "Guard ordering
+    # within the loop"). Distance-anchored the same way state O's own
+    # trigger-adjacent tracking works elsewhere in this file: record
+    # where the continuous white streak began, only fire once travel
+    # since then reaches the threshold, and reset the anchor the instant
+    # either sensor stops reading white -- a brief gap (a corner, a
+    # crossing) never accumulates toward it.
+    both_white = is_white(l_hsv) and is_white(r_hsv)
+    now_mm = robot.distance()
+    if both_white:
+        if _line_lost_start_mm is None:
+            _line_lost_start_mm = now_mm
+        elif now_mm - _line_lost_start_mm >= LINE_LOST_MM:
+            _line_lost_start_mm = None
+            print("line lost: both white for %d mm" % LINE_LOST_MM)
+            return "B"
+    else:
+        _line_lost_start_mm = None
+
     return None
 
 
@@ -651,13 +683,38 @@ def state_O():
     return "H"
 
 
+ZONE_BACKUP_MM = 300           # move backward this far once B decides
+                               # the line is genuinely gone, before
+                               # flagging zone mode active. Untested
+                               # placeholder.
+ZONE_BACKUP_SPEED_MM_S = 60    # mm/s for the backup move -- applied via
+                               # robot.settings() before straight(), same
+                               # reasoning as INTERSECTION_CROSS_SPEED_MM_S
+
+
 def state_B():
-    """Zone check (design.md Sec6)."""
-    # TODO: raise the camera, spin 360 scanning for zone targets.
-    #   -> F   case b (line seen -- spin to it and resume)
-    #   -> A   case c (a sphere was located -- go straight for it)
-    #   -> V   case d (zone confirmed, no sphere yet -- survey)
-    #   -> H   case a, e (nothing found, or camera unreachable)
+    """Zone check (design.md Sec6) -- simplified: just recognise that the
+    line is genuinely gone (guard 4 already confirmed both-white for
+    LINE_LOST_MM) and flag zone mode active, without doing anything with
+    that yet. Design.md's fuller spec -- raise the camera, spin 360
+    scanning for zone targets, dispatch to F/A/V/H -- is not implemented;
+    there's nowhere further to go yet, so this only ever stays in B."""
+    global _zone_mode_active
+
+    if _zone_mode_active:
+        robot.stop()  # already activated -- idle, nothing further
+                       # implemented yet (see docstring)
+        return None
+
+    # Cancel state_F()'s continuous drive() before the blocking
+    # straight() move below -- same reasoning as every other state that
+    # takes direct/blocking control.
+    robot.stop()
+    robot.settings(straight_speed=ZONE_BACKUP_SPEED_MM_S)
+    robot.straight(-ZONE_BACKUP_MM)  # negative = backward
+
+    _zone_mode_active = True
+    print("zone: mode activated")
     return None
 
 
@@ -739,6 +796,10 @@ state = "F"  # starts directly in F rather than S, since S's real
              # start-button wait isn't implemented yet either
 was_pressed = False
 _green_streak = 0  # state_F()'s green-guard debounce counter
+_line_lost_start_mm = None  # state_F()'s guard-4 distance anchor (None
+                            # while not currently both-white)
+_zone_mode_active = False  # state_B()'s one-shot entry guard -- True
+                           # once the backup move has run once
 
 # Per-state arm gate, not a per-transition one. Only meaningful when
 # DEBUG_MODE is True: every freshly-entered state (including F on the
