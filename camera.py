@@ -98,7 +98,7 @@ def set_tilt(angle_deg, time_ms=0):
 # same as before the hub link existed. Once Hub 1 calls the "mode"
 # command (see the PUPRemote section below), `zone_mode` is what actually
 # drives the main loop, kept up to date by that command's callback.
-ZONE_MODE_ENABLED = True
+ZONE_MODE_ENABLED = False
 zone_mode = ZONE_MODE_ENABLED
 
 # --- hub link (PUPRemote) -----------------------------------------------
@@ -119,12 +119,15 @@ zone_mode = ZONE_MODE_ENABLED
 # already knows which mode it just asked for:
 #   LINE (echoed_mode=0): ahead, angle, length, coverage, background_code, 0
 #     background_code: 0=black, 1=white, 2=unclear (see BACKGROUND_CODE)
-#   ZONE (echoed_mode=1): sphere_count, first_kind, first_bearing_deg,
-#                         first_dist_mm, green_found, red_found
-#     first_kind: -1=no sphere, 0=dead, 1=live -- only the first (not
-#     necessarily nearest) sphere found; sphere_count says how many were
-#     really out there. A fixed 8-field reply can't carry a variable-length
-#     list, which is the real constraint driving this whole design.
+#   ZONE (echoed_mode=1): sphere_count, nearest_kind, nearest_bearing_deg,
+#                         nearest_dist_mm, green_found, red_found
+#     nearest_kind: -1=no sphere, 0=dead, 1=live. A fixed 8-field reply
+#     can't carry a variable-length list, which is the real constraint
+#     driving this whole design -- so of however many spheres are in
+#     frame, these three fields describe the NEAREST one (smallest
+#     estimated range), and sphere_count says how many there really were.
+#     Nearest rather than first-found because that's the one the hub
+#     would want to drive at, and it has no way to ask for another.
 #
 # Both caches below are updated once per frame in the main loop, and
 # mode() just reads whichever one matches current zone_mode -- same
@@ -867,13 +870,37 @@ while True:
         print("ZONE spheres:", spheres, "green:", green_pos, "red:", red_pos)
 
         # Cache for the "mode" command's reply -- see its comment above
-        # for the field layout. Only the first sphere's info fits; count
-        # still reports how many were really found.
-        if spheres:
-            first_kind, first_x, first_y, first_r, first_dist, first_bearing = spheres[0]
-            kind_code = 1 if first_kind == "live" else 0
-            dist_code = int(first_dist) if first_dist is not None else 0
-            bearing_code = int(round(first_bearing))
+        # for the field layout. Only ONE sphere's details fit in the
+        # reply, so pick the NEAREST rather than whatever find_spheres()
+        # happened to list first: with several balls in frame the closest
+        # is the one worth driving at, and the hub has no way to ask for
+        # a different one. count still reports how many were really out
+        # there.
+        #
+        # Explicit loop rather than min(key=...) -- the None handling
+        # below is the whole point, and spelling it out avoids relying on
+        # sorted()/min() keyword support in this MicroPython build.
+        nearest = None
+        for sphere in spheres:
+            if sphere[4] is None:
+                continue  # no usable range -- see the fallback below
+            if nearest is None or sphere[4] < nearest[4]:
+                nearest = sphere
+
+        # Every sphere came back with an unusable distance.
+        # estimate_distance_mm() returns None when a ball's base projects
+        # above the horizon, which shouldn't happen for anything actually
+        # sitting on the floor -- but fall back to the first rather than
+        # reporting "no sphere at all", since bearing is still meaningful
+        # when range isn't, and the hub's centring loop only needs bearing.
+        if nearest is None and spheres:
+            nearest = spheres[0]
+
+        if nearest is not None:
+            kind, _x, _y, _r, dist, bearing = nearest
+            kind_code = 1 if kind == "live" else 0
+            dist_code = int(dist) if dist is not None else 0
+            bearing_code = int(round(bearing))
         else:
             kind_code, dist_code, bearing_code = -1, 0, 0
         _last_zone_result = (

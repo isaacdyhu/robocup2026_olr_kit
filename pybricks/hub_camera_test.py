@@ -205,8 +205,10 @@ hub = PrimeHub()
 # is 8 shorts; f2..f7 mean different things depending on echoed_mode, per
 # camera.py's own comment above its "mode" registration:
 #   LINE (echoed_mode=0): ahead, angle, length, coverage, bg_code, unused
-#   ZONE (echoed_mode=1): sphere_count, first_kind, first_bearing,
-#                         first_dist_mm, green_found, red_found
+#   ZONE (echoed_mode=1): sphere_count, nearest_kind, nearest_bearing,
+#                         nearest_dist_mm, green_found, red_found
+#   -- of however many spheres are in frame, those three describe the
+#   NEAREST one; sphere_count says how many there really were.
 camera = PUPRemoteHub(Port.D)
 camera.add_command("mode", to_hub_fmt="hhhhhhhh", from_hub_fmt="b")
 
@@ -255,7 +257,7 @@ while True:
               (label, ahead, angle, length, coverage, bg_name))
     else:
         count, kind, bearing, dist, green_found, red_found = f2, f3, f4, f5, f6, f7
-        print("ZONE spheres=%d first=%s bearing=%ddeg dist=%dmm green=%s red=%s" %
+        print("ZONE spheres=%d nearest=%s bearing=%ddeg dist=%dmm green=%s red=%s" %
               (count, SPHERE_KIND_NAME.get(kind, "?"), bearing, dist,
                "y" if green_found else "n", "y" if red_found else "n"))
 
