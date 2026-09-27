@@ -1653,15 +1653,18 @@ def state_D():
 
 DEPOSIT_SPEED_MM_S = 150       # mm/s for the drive up to the zone
 
-DEPOSIT_CORRECTION_MM = -80   # SIGNED, added to the camera's reported range
-                              # exactly as APPROACH_CORRECTION_MM is. More
-                              # negative than that one because the robot
-                              # must stop SHORT of the zone wall with the
-                              # ball overhanging it, not drive its own
-                              # wheels up to where the target was seen.
+DEPOSIT_CORRECTION_MM = 0    # SIGNED, added to the camera's reported range
+                              # exactly as APPROACH_CORRECTION_MM is -- but
+                              # POSITIVE, unlike that one. The approach
+                              # stops short so the ball ends up in the
+                              # claw; this drives slightly PAST the point
+                              # the camera reported, so the ball is clear
+                              # of the zone's edge and over the zone
+                              # itself when it drops rather than landing
+                              # on the lip and rolling back out.
                               # Untested placeholder.
 
-DEPOSIT_BACKOFF_MM = 50      # reversed after releasing, BEFORE anything
+DEPOSIT_BACKOFF_MM = 100      # reversed after releasing, BEFORE anything
                               # rotates. The drive-up deliberately parks
                               # the robot overhanging the zone wall, which
                               # is exactly the wrong place to start
