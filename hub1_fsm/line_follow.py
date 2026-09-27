@@ -1039,17 +1039,22 @@ SCAN_SETTLE_MS = 500           # pause after each pivot, before querying.
 # All untested placeholders, same as every other numeric constant here.
 
 
-def query_zone_camera():
+def query_zone_camera(kind_filter=KIND_NONE):
     """
     Ask for the nearest zone target and return (kind, bearing_deg,
     range_mm), or None if the camera never answered.
 
-    Uses CAMERA_AIM_POLL_TRIES because 'Z' re-points the camera, and asks
-    with no kind filter so the reply is whatever is nearest -- callers
-    decide whether that kind is one they wanted. Filtering here instead
-    would mean asking twice to cover both sphere kinds.
+    Uses CAMERA_AIM_POLL_TRIES because 'Z' re-points the camera.
+
+    kind_filter defaults to KIND_NONE, "nearest of anything", which is
+    what the ball search wants: the filter only takes ONE kind, so
+    covering both sphere kinds would mean asking twice. Pass a specific
+    KIND_* when exactly one target type will do -- the evacuation-point
+    search does, and it matters there, because filtering in the camera
+    means a wrong-coloured point standing nearer cannot mask the right
+    one. Checking the kind after the fact could not recover that.
     """
-    reply = ask(QUESTION_ZONE, CAMERA_AIM_POLL_TRIES)
+    reply = ask(QUESTION_ZONE, CAMERA_AIM_POLL_TRIES, kind_filter)
     if reply is None:
         return None
     _echo, kind, bearing, range_mm = reply
@@ -1165,7 +1170,15 @@ def state_V():
         print("survey: camera did not answer the first zone question, "
               "scanning anyway")
 
+    global _zone_heading0
+
     heading0 = hub.imu.heading()  # scan angles below are relative to this
+    # Kept for state_D(): once a ball has been found and captured the
+    # robot is left pointing at wherever that ball was, which is no use
+    # as a reference for the NEXT sweep. This is the heading the zone was
+    # entered on, and it is what the evacuation-point survey measures its
+    # own angles against.
+    _zone_heading0 = heading0
 
     for angle in SCAN_ANGLES_DEG:
         rotate_to_heading(0, heading0 + angle, SCAN_ROTATE_SPEED_DPS)
@@ -1328,6 +1341,29 @@ def state_A():
         print("approach: no usable range to the ball")
         return "V"
 
+    # Remember WHICH victim this is, because after the capture nothing
+    # can tell any more -- the ball is inside the claw and out of the
+    # camera's view, and a dark sphere and a light one look identical
+    # from the outside of a closed claw. state_D() needs it to pick the
+    # matching evacuation point, and this reading is the last confident
+    # look anything gets at it.
+    global _captured_kind, _captured_heading
+    _captured_kind = kind
+
+    # And WHERE it was, as a bearing off the zone entry heading. Nothing
+    # rotates between here and the capture -- the drive below is
+    # straight, and state_C() only works the claw -- so this is the
+    # orientation the ball is captured at. state_D() reads its sign to
+    # work out which side of the zone the robot has ended up on.
+    if _zone_heading0 is None:
+        _captured_heading = None
+    else:
+        _captured_heading = hub.imu.heading() - _zone_heading0
+
+    print("approach: carrying kind=%d (%s) at %s deg off entry" %
+          (kind, "light/living" if kind == KIND_SPHERE_LIGHT else "dark/dead",
+           "?" if _captured_heading is None else "%d" % _captured_heading))
+
     # Claw down before a wheel turns, but AFTER the range is known --
     # lowering it mid-drive would swing the lifter through the space the
     # ball occupies instead of arriving with it already open around it.
@@ -1388,12 +1424,167 @@ def state_C():
     return "D"
 
 
-def state_D():
-    """DELIVER (design.md Sec7)."""
-    # TODO -> T (arrived at the correct triangle) / A (dropped, still
-    #         visible) / V (dropped and gone, or triangle missing) /
-    #         Q (blocked, or hub 2 FAULT)
+# --- deliver (design.md Sec7 "DELIVER (state D)") ----------------------------
+
+# A much wider sweep than the ball search: the evacuation points sit on
+# the zone walls rather than out on the floor, so after a capture has
+# dragged the robot off to one side they can easily be behind it. 45 deg
+# steps against the camera's ~58 deg horizontal field leave an overlap at
+# every step, and the list ends exactly on +135 -- which is where the
+# reposition below assumes the robot is left standing after a failure.
+DELIVER_SCAN_ANGLES_DEG = [-135, -90, -45, 0, 45, 90, 135]
+
+# Sweeps before giving up: the first from wherever the capture left the
+# robot, then one more from the middle of the zone after repositioning.
+DELIVER_SWEEPS = 2
+
+DELIVER_MIDDLE_TURN_DEG = 90    # face straight across the zone to cross it
+DELIVER_MIDDLE_DRIVE_MM = 300   # 30 cm toward the middle
+DELIVER_MIDDLE_SPEED_MM_S = 80
+
+# Kinds 3 and 4 -- the evacuation points themselves, as opposed to the
+# spheres SPHERE_KINDS covers.
+POINT_KINDS = (KIND_POINT_GREEN, KIND_POINT_RED)
+
+# Which point each victim goes to, straight off camera.py's own
+# definitions: KIND_SPHERE_LIGHT is "a silver victim" and
+# KIND_POINT_GREEN is "evacuation point for the living"; KIND_SPHERE_DARK
+# is "the black victim" and KIND_POINT_RED is "for the dead". Delivering
+# to the wrong one is not a crash, it is a silently lost score, which is
+# why the pairing lives in one named place rather than in an if.
+POINT_FOR_SPHERE = {
+    KIND_SPHERE_LIGHT: KIND_POINT_GREEN,   # silver -> living -> green
+    KIND_SPHERE_DARK: KIND_POINT_RED,      # black  -> dead   -> red
+}
+
+
+def sweep_for_point(base, kind_filter, acceptable):
+    """
+    One full DELIVER_SCAN_ANGLES_DEG sweep, measured off `base`.
+
+    Returns (angle, kind, bearing, range_mm) for the first acceptable
+    target seen, or None having finished the sweep. Either way the robot
+    is left pointing at the last angle in the list, which the caller
+    relies on when deciding where to reposition from.
+    """
+    for angle in DELIVER_SCAN_ANGLES_DEG:
+        rotate_to_heading(0, base + angle, SCAN_ROTATE_SPEED_DPS)
+        wait(SCAN_SETTLE_MS)
+
+        result = query_zone_camera(kind_filter)
+        if result is None:
+            print("deliver: camera not responding at %d deg" % angle)
+            continue
+
+        kind, bearing, dist = result
+        print("deliver: %d deg -- kind=%d bearing=%d range=%d"
+              % (angle, kind, bearing, dist))
+
+        # Still checked even when the camera was filtering, because the
+        # unknown-kind path asks with no filter at all.
+        if kind in acceptable:
+            return angle, kind, bearing, dist
+
     return None
+
+
+def state_D():
+    """DELIVER (design.md Sec7) -- find the evacuation point matching the
+    captured victim, crossing to the middle of the zone and looking again
+    if the first sweep cannot see it."""
+    robot.stop()
+
+    # Why not sweep from the current heading: by now the robot has been
+    # turned to face a ball, driven at it and captured it, so where it
+    # points is "wherever that ball happened to be". state_V() recorded
+    # the heading the zone was ENTERED on, and every angle below is
+    # measured off that instead.
+    if _zone_heading0 is None:
+        # Only reachable if D is entered without V having run -- debug
+        # stepping straight into it, say. Fall back rather than crash.
+        print("deliver: no zone entry heading recorded, sweeping from here")
+        base = hub.imu.heading()
+    else:
+        base = _zone_heading0
+
+    # Which point this victim belongs at, from the kind state_A() recorded
+    # before capturing it. Asking the camera to filter on that kind beats
+    # sifting the replies here: the camera reports only the NEAREST target
+    # it considers, so without the filter a wrong-coloured point standing
+    # closer would mask the right one entirely, and no amount of checking
+    # afterwards could recover it.
+    wanted = POINT_FOR_SPHERE.get(_captured_kind)
+    if wanted is None:
+        # D entered without A having recorded a kind -- debug stepping,
+        # or a capture that never went through the approach. Take either
+        # point rather than refusing to deliver at all.
+        print("deliver: captured kind unknown, accepting either point")
+        kind_filter = KIND_NONE
+        acceptable = POINT_KINDS
+    else:
+        kind_filter = wanted
+        acceptable = (wanted,)
+        print("deliver: carrying kind=%d, looking for point kind=%d (%s)"
+              % (_captured_kind, wanted,
+                 "green/living" if wanted == KIND_POINT_GREEN else "red/dead"))
+
+    for sweep in range(DELIVER_SWEEPS):
+        print("deliver: sweep %d of %d, %d to %d deg off entry heading %d"
+              % (sweep + 1, DELIVER_SWEEPS, DELIVER_SCAN_ANGLES_DEG[0],
+                 DELIVER_SCAN_ANGLES_DEG[-1], base))
+
+        found = sweep_for_point(base, kind_filter, acceptable)
+        if found is not None:
+            angle, kind, bearing, dist = found
+            print("deliver: evacuation point found at %d deg "
+                  "(kind=%d bearing=%d range=%d)"
+                  % (angle, kind, bearing, dist))
+            # TODO: the delivery itself is still blank. design.md Sec7
+            # has D arriving at the triangle before T deposits, which
+            # needs the centre-and-approach pair state_V()/state_A()
+            # already do for a ball. Going straight to T deposits at
+            # whatever range the point was spotted from.
+            return "T"
+
+        if sweep == DELIVER_SWEEPS - 1:
+            break
+
+        # --- nothing found: cross to the middle and look again ---------
+        #
+        # Which way the middle is follows from where the capture left the
+        # robot. A ball found to the LEFT of the entry heading was
+        # chased leftward, so the robot is now on the zone's left side
+        # and the middle lies to its right, and vice versa. Turning to
+        # base +/- 90 points it straight ACROSS the zone, so driving
+        # forward from there translates it sideways rather than deeper
+        # in.
+        if _captured_heading is None:
+            # No recorded capture bearing (D entered without A). Pick a
+            # side rather than stalling, and say that it is a guess.
+            on_left = False
+            print("deliver: no capture bearing recorded, guessing right side")
+        else:
+            # Exactly 0 counts as the right side -- an arbitrary
+            # tie-break for a robot that is already centred, where
+            # either direction is as good as the other.
+            on_left = _captured_heading < 0
+
+        across = DELIVER_MIDDLE_TURN_DEG if on_left else -DELIVER_MIDDLE_TURN_DEG
+        print("deliver: nothing found; on the %s side, crossing %d deg "
+              "and driving %d mm toward the middle"
+              % ("left" if on_left else "right", across, DELIVER_MIDDLE_DRIVE_MM))
+
+        rotate_to_heading(0, base + across, SCAN_ROTATE_SPEED_DPS)
+        robot.settings(straight_speed=DELIVER_MIDDLE_SPEED_MM_S)
+        robot.straight(DELIVER_MIDDLE_DRIVE_MM)
+        robot.stop()
+
+        # The sweep angles below are still measured off `base`. Driving
+        # moved the robot but not its heading reference, so the same
+        # absolute targets remain correct from the new position.
+
+    print("deliver: no evacuation point found after %d sweep(s)" % DELIVER_SWEEPS)
+    return "V"  # design.md Sec7: D -> V when the triangle is missing
 
 
 def state_T():
@@ -1460,6 +1651,13 @@ was_pressed = False
 _green_streak = 0  # state_F()'s green-guard debounce counter
 _line_lost_start_mm = None  # state_F()'s guard-4 distance anchor (None
                             # while not currently both-white)
+_zone_heading0 = None      # heading the zone survey started from, recorded
+                           # by state_V() and reused by state_D()
+_captured_kind = KIND_NONE  # which sphere kind state_A() drove at, so
+                            # state_D() knows which point to deliver to
+_captured_heading = None    # bearing off the zone entry heading the ball
+                            # was captured at; its SIGN tells state_D()
+                            # which side of the zone the robot is on
 _zone_mode_active = False  # state_B()'s one-shot entry guard -- True
                            # once the backup move has run once
 
