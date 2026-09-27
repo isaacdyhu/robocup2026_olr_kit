@@ -1796,7 +1796,7 @@ DEPOSIT_BACKOFF_MM = 100      # reversed after releasing, BEFORE anything
                               # the chassis straight into it. Untested
                               # placeholder.
 
-DELIVERIES_TO_EGRESS = 3      # victims to deliver before giving up on the
+DELIVERIES_TO_EGRESS = 1      # victims to deliver before giving up on the
                               # zone and heading for the exit
 
 # The zone is a triangle in a corner, so its two straight edges run at
@@ -1914,11 +1914,141 @@ def state_T():
     return "V"  # released -- go find the next victim
 
 
+# --- egress (design.md Sec7 "EGRESS (state K)") ------------------------------
+
+EGRESS_EXIT_BEARING_DEG = 180  # relative to the zone entry heading: the way
+                               # the robot came in, so the way back out
+EGRESS_WALL_STANDOFF_MM = 200  # close on the wall until this near
+EGRESS_GAP_MM = 300            # ultrasonic reading above this means no wall
+                               # ahead -- i.e. the exit
+EGRESS_SIDESTEP_MM = 100       # sideways shuffle between wall readings
+EGRESS_EXIT_DRIVE_MM = 500     # how far to drive out through the gap
+EGRESS_SPEED_MM_S = 80
+EGRESS_POLL_MS = 20
+
+EGRESS_APPROACH_MAX_MM = 1500  # give up closing on a wall that never
+                               # arrives, rather than crossing the field
+EGRESS_MAX_SIDESTEPS = 10      # 20 x 100mm is two metres of wall, well past
+                               # any real zone edge
+# All untested placeholders, same as every other numeric constant here.
+
+
+def zone_middle_turn_deg():
+    """Relative bearing pointing across the zone, toward its middle.
+
+    Which half the robot is on comes from the corner it last delivered
+    to -- the two negative edge angles are the left half of the zone, the
+    two positive ones the right -- falling back to where the last ball
+    was captured if nothing has been delivered. Left half crosses to
+    +90, right half to -90.
+    """
+    if _deposit_align_deg is not None:
+        on_left = _deposit_align_deg < 0
+    elif _captured_heading is not None:
+        on_left = _captured_heading < 0
+    else:
+        on_left = False
+    return RECOVER_MIDDLE_TURN_DEG if on_left else -RECOVER_MIDDLE_TURN_DEG
+
+
+def any_sensor_black():
+    """True if ANY of the four colour sensors is over black.
+
+    Two of them are hub 1's own inner pair. The other two live on hub 2
+    and arrive in its state broadcast, published as raw hsv() VALUE
+    readings on the same 0-100 scale -- which is why BLACK_VAL_MAX
+    applies to all four without conversion. With hub 2 disabled only the
+    inner pair is consulted, so the line can still be caught, just across
+    a narrower span of the chassis.
+    """
+    l_hsv, r_hsv = read_sensors()
+    if is_black(l_hsv) or is_black(r_hsv):
+        return True
+
+    if not HUB2_ENABLED:
+        return False
+
+    state = hub.ble.observe(STATE_CHANNEL)
+    if state is None or len(state) < 5:
+        return False
+    return state[3] <= BLACK_VAL_MAX or state[4] <= BLACK_VAL_MAX
+
+
 def state_K():
-    """EGRESS (design.md Sec7)."""
-    # TODO -> F (out of the zone, line reacquired, +20) / Q (cannot find
-    #         the exit)
-    return None
+    """EGRESS (design.md Sec7) -- leave the zone by the edge it was
+    entered from, feeling along the wall for the gap."""
+    robot.stop()
+
+    base = _zone_heading0 if _zone_heading0 is not None else hub.imu.heading()
+
+    # Face the way the robot came in. K is entered pointing INTO the zone
+    # -- state_T() left it squared to a corner -- so this is the turn
+    # that puts the exit edge ahead rather than behind.
+    print("egress: turning to %d off entry to face the exit edge"
+          % EGRESS_EXIT_BEARING_DEG)
+    rotate_to_relative(base, EGRESS_EXIT_BEARING_DEG, SCAN_ROTATE_SPEED_DPS)
+
+    # --- close on the wall --------------------------------------------
+    start = robot.distance()
+    robot.settings(straight_speed=EGRESS_SPEED_MM_S)
+    robot.drive(EGRESS_SPEED_MM_S, 0)
+    while ultrasonic_sensor.distance() > EGRESS_WALL_STANDOFF_MM:
+        if robot.distance() - start >= EGRESS_APPROACH_MAX_MM:
+            robot.stop()
+            print("egress: drove %d mm without meeting a wall"
+                  % EGRESS_APPROACH_MAX_MM)
+            return "Q"  # design.md Sec7: K -> Q when the exit can't be found
+        wait(EGRESS_POLL_MS)
+    robot.stop()
+    print("egress: wall at %d mm" % ultrasonic_sensor.distance())
+
+    # --- feel along it for the gap ------------------------------------
+    #
+    # Shuffle sideways toward the middle of the zone, re-facing the wall
+    # to measure each time. The exit is simply where the wall stops
+    # being there, so the search ends on a reading long enough that
+    # nothing can be in front.
+    across = zone_middle_turn_deg()
+    print("egress: searching along the wall toward %d" % across)
+
+    found = False
+    for step in range(EGRESS_MAX_SIDESTEPS):
+        reading = ultrasonic_sensor.distance()
+        print("egress: step %d, wall at %d mm" % (step, reading))
+        if reading > EGRESS_GAP_MM:
+            found = True
+            break
+
+        rotate_to_relative(base, across, SCAN_ROTATE_SPEED_DPS)
+        drive_on(EGRESS_SIDESTEP_MM)
+        rotate_to_relative(base, EGRESS_EXIT_BEARING_DEG, SCAN_ROTATE_SPEED_DPS)
+
+    if not found:
+        print("egress: no gap after %d steps along the wall"
+              % EGRESS_MAX_SIDESTEPS)
+        return "Q"
+
+    # --- out through the gap ------------------------------------------
+    #
+    # Watching all four sensors the whole way: the point of leaving is to
+    # meet the line again, and the first black any of them sees is it.
+    # Stopping ON that black rather than driving the full distance is
+    # what leaves state F something to pick up.
+    print("egress: gap found, driving out up to %d mm" % EGRESS_EXIT_DRIVE_MM)
+    start = robot.distance()
+    robot.drive(EGRESS_SPEED_MM_S, 0)
+    while robot.distance() - start < EGRESS_EXIT_DRIVE_MM:
+        if any_sensor_black():
+            robot.stop()
+            print("egress: black seen after %d mm -- line reacquired"
+                  % (robot.distance() - start))
+            return "F"
+        wait(EGRESS_POLL_MS)
+    robot.stop()
+
+    print("egress: drove the full %d mm without seeing black"
+          % EGRESS_EXIT_DRIVE_MM)
+    return "F"  # out of the zone either way; F will hunt for the line
 
 
 def state_Q():
