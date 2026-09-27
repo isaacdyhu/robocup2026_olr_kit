@@ -57,7 +57,7 @@ from pybricks.iodevices import PUPDevice
 # are skipped outright and the states that use them still run, so the
 # driving can be tested without hub 2 present. Turn it on once hub 2 is
 # actually running pybricks/hub2_code.py.
-HUB2_ENABLED = False
+HUB2_ENABLED = True
 
 # Channel numbers and goal letters are COPIES of pybricks/hub2_code.py's
 # own constants, checked against that file directly rather than taken
@@ -927,14 +927,91 @@ class _PUPRemoteHub(_PUPRemote):
         return result[0] if len(result) == 1 else result
 
 
-# to_hub_fmt/from_hub_fmt must match camera.py's add_command("mode", ...)
-# exactly, and this project's own hub_camera_test.py already confirmed
-# them end-to-end. ZONE (echoed_mode=1) reply fields, per camera.py's own
-# comment above its "mode" registration:
-#   count, kind, bearing_deg, dist_mm, green_found, red_found
-# kind: -1 = no sphere, 0 = dead, 1 = live.
+# --- the 'look' protocol ----------------------------------------------------
+#
+# Formats must match camera.py's own add_command exactly, and the whole
+# question/echo dance below mirrors pybricks/hub_camera_test.py's ask(),
+# which is the reference implementation this was checked against.
+#
+# REQUEST, 4 bytes: (question, seq, kind_filter, 0)
+#   question    one of the QUESTION_* letters below; it also decides where
+#               the camera aims, so there is no separate mode command any
+#               more -- asking a zone question IS what tilts the camera up
+#               for the zone, and asking a line question tilts it back down.
+#   seq         1..255, bumped for every fresh question
+#   kind_filter KIND_* to hunt one target type, or KIND_NONE for "nearest
+#               of anything". Only 'Z' reads it.
+#
+# REPLY, 4 shorts: (echo, a, b, c)
+#   'Z'         (echo, kind, bearing_deg, range_mm)
+#   'J'/'M'/'A' (echo, line_ahead 0/1, angle_deg, coverage_percent)
+#
+# The echo is the point of the whole design. The camera adopts a new seq
+# only once it is actually aimed where that question wants AND the servo
+# has stopped, so a reply whose echo matches is guaranteed to have been
+# computed from a settled frame taken after the request. Polling until
+# the echo matches is therefore how the hub waits for the camera, and it
+# replaces the old scheme of guessing a fixed hub-side delay.
 camera = _PUPRemoteHub(Port.D)
-camera.add_command("mode", to_hub_fmt="hhhhhhhh", from_hub_fmt="b")
+camera.add_command("look", to_hub_fmt="hhhh", from_hub_fmt="4s")
+
+QUESTION_JUNCTION = ord('J')    # black line continuing ahead? how much BLACK?
+QUESTION_SEAM = ord('M')        # same, but measuring WHITE
+QUESTION_AHEAD = ord('A')       # line anywhere ahead? raised aim
+QUESTION_ZONE = ord('Z')        # nearest evacuation-zone target
+
+KIND_NONE = 0
+KIND_SPHERE_DARK = 1            # the black victim
+KIND_SPHERE_LIGHT = 2           # a silver victim
+KIND_POINT_GREEN = 3            # evacuation point for the living
+KIND_POINT_RED = 4              # evacuation point for the dead
+
+# A ball is either sphere kind. Points are NOT balls -- checking merely
+# "kind != KIND_NONE" would have the survey charge at an evacuation
+# corner, which is the one mistake this split exists to prevent.
+SPHERE_KINDS = (KIND_SPHERE_DARK, KIND_SPHERE_LIGHT)
+
+CAMERA_WAIT_MS = 6              # PUPRemote call timeout
+CAMERA_POLL_GAP_MS = 30         # between polls while waiting for the echo
+CAMERA_POLL_TRIES = 10          # enough when the aim is already correct
+
+# An aim change costs the camera's TILT_MOVE_MS + TILT_SETTLE_MS before it
+# will echo at all, so any question that re-points the servo needs a much
+# bigger budget than one that doesn't. Same figures hub_camera_test.py
+# uses, for the same reason.
+CAMERA_AIM_SETTLE_MS = 1000
+CAMERA_AIM_POLL_TRIES = CAMERA_AIM_SETTLE_MS // CAMERA_POLL_GAP_MS + 10
+
+_camera_seq = 0
+
+
+def ask(question, tries=CAMERA_POLL_TRIES, kind_filter=KIND_NONE):
+    """
+    Put one question to the camera and poll until it answers THAT question.
+
+    Returns the raw (echo, a, b, c), or None if the camera never echoed
+    the sequence byte within `tries` polls. Pass CAMERA_AIM_POLL_TRIES for
+    any question that moves the aim ('A' and 'Z'), or the answer will be
+    given up on while the servo is still travelling.
+    """
+    global _camera_seq
+    _camera_seq = (_camera_seq + 1) & 0xFF
+    request = bytes((question, _camera_seq, kind_filter, 0))
+
+    for _ in range(tries):
+        try:
+            reply = camera.call("look", request, wait_ms=CAMERA_WAIT_MS)
+        except Exception as error:
+            print("camera: %s query failed: %s" % (chr(question), error))
+            return None
+
+        if reply[0] == _camera_seq:
+            return reply
+        wait(CAMERA_POLL_GAP_MS)
+
+    print("camera: %s never echoed seq %d in %d polls"
+          % (chr(question), _camera_seq, tries))
+    return None
 
 
 # --- zone survey (design.md Sec7 "SURVEY (state V)") -------------------------
@@ -949,35 +1026,34 @@ SCAN_ANGLES_DEG = [-70, -60, -30, 0, 30, 60, 70]
 SCAN_ROTATE_SPEED_DPS = 100     # deg/s for each pivot step and the final
                                 # bearing-centring correction
 
-# The camera doesn't switch into ZONE mode instantly -- it needs a frame
-# or two after the "mode" command lands (pybricks/hub_camera_test.py's
-# own "(switching...)" comment describes the same lag) -- so both of the
-# retry loops below resend/re-check rather than trusting a single call.
-SCAN_MODE_SWITCH_RETRIES = 20   # attempts to confirm ZONE mode before
-                                # the scan itself starts
-SCAN_MODE_SWITCH_POLL_MS = 50
-SCAN_SETTLE_MS = 1500            # pause after each pivot, before querying,
-                                # so the camera grabs a frame at the new heading
-SCAN_QUERY_RETRIES = 5          # per-angle attempts to get a fresh ZONE reply
-SCAN_QUERY_POLL_MS = 50
+SCAN_SETTLE_MS = 500           # pause after each pivot, before querying.
+                                # Much of what this used to cover is now
+                                # the protocol's job -- the echo is only
+                                # given for a frame taken after the
+                                # request, with the servo settled -- but it
+                                # still buys the CHASSIS time to stop
+                                # rocking after a pivot, which the camera
+                                # has no way to know about. Probably
+                                # reducible a long way from 1500 now; worth
+                                # retuning once the new link is proven.
 # All untested placeholders, same as every other numeric constant here.
 
 
 def query_zone_camera():
     """
-    Ask the camera for its current ZONE-mode reading, retrying up to
-    SCAN_QUERY_RETRIES times if echoed_mode hasn't caught up to ZONE yet
-    (see this section's header comment on why that lag is expected, not
-    a bug). Returns (count, kind, bearing_deg, dist_mm, green_found,
-    red_found), or None if the camera never confirmed ZONE mode within
-    the retry budget.
+    Ask for the nearest zone target and return (kind, bearing_deg,
+    range_mm), or None if the camera never answered.
+
+    Uses CAMERA_AIM_POLL_TRIES because 'Z' re-points the camera, and asks
+    with no kind filter so the reply is whatever is nearest -- callers
+    decide whether that kind is one they wanted. Filtering here instead
+    would mean asking twice to cover both sphere kinds.
     """
-    for _ in range(SCAN_QUERY_RETRIES):
-        echoed_mode, heartbeat, f2, f3, f4, f5, f6, f7 = camera.call("mode", 1, wait_ms=5)
-        if echoed_mode == 1:
-            return f2, f3, f4, f5, f6, f7
-        wait(SCAN_QUERY_POLL_MS)
-    return None
+    reply = ask(QUESTION_ZONE, CAMERA_AIM_POLL_TRIES)
+    if reply is None:
+        return None
+    _echo, kind, bearing, range_mm = reply
+    return kind, bearing, range_mm
 
 
 # --- closing the loop on bearing ---------------------------------------------
@@ -1025,7 +1101,7 @@ def centre_on_ball():
     how long the scan was found to need, standing still, before the camera
     returns a detection worth trusting. An earlier version of this rotated
     continuously and polled as it went, which gave the camera no still
-    time at all: it reported no ball (kind == -1) and this bailed out with
+    time at all: it reported no ball and this bailed out with
     "ball lost mid-turn" every time. Rotation speed was never the problem
     and slowing it down did not fix it -- the camera needs stillness, not
     gentleness.
@@ -1047,10 +1123,10 @@ def centre_on_ball():
             print("centre: camera not responding")
             return False
 
-        count, kind, bearing, dist, green_found, red_found = result
+        kind, bearing, dist = result
 
-        if kind == -1:
-            print("centre: no ball visible at step %d" % step)
+        if kind not in SPHERE_KINDS:
+            print("centre: no ball visible at step %d (kind=%d)" % (step, kind))
             return False
 
         if abs(bearing) <= CENTRE_TOLERANCE_DEG:
@@ -1079,18 +1155,15 @@ def state_V():
     # other state that takes over the motors directly.
     robot.stop()
 
-    # Make sure the camera is actually in ZONE mode before scanning --
-    # state_B() only flags zone mode locally, it doesn't yet tell the
-    # camera itself to switch (out of scope to add there right now), so
-    # it's confirmed here instead, once, before the scan begins.
-    for _ in range(SCAN_MODE_SWITCH_RETRIES):
-        echoed_mode = camera.call("mode", 1, wait_ms=5)[0]
-        if echoed_mode == 1:
-            wait(SCAN_SETTLE_MS)
-            break
-        wait(SCAN_MODE_SWITCH_POLL_MS)
-    else:
-        print("survey: camera never confirmed ZONE mode, scanning anyway")
+    # No mode to switch into any more: asking QUESTION_ZONE is itself
+    # what re-aims the camera, and its echo is withheld until that aim
+    # has settled. This first ask is still worth making before the scan
+    # starts, though -- it pays the one-off aim cost here rather than
+    # inside the first scan step, where it would look like that angle
+    # being slow to answer.
+    if query_zone_camera() is None:
+        print("survey: camera did not answer the first zone question, "
+              "scanning anyway")
 
     heading0 = hub.imu.heading()  # scan angles below are relative to this
 
@@ -1113,12 +1186,14 @@ def state_V():
             print("survey: camera not responding at %d deg" % angle)
             continue
 
-        count, kind, bearing, dist, green_found, red_found = result
-        print("survey: camera says count=%d kind=%d bearing=%d dist=%d green=%s red=%s" %
-              (count, kind, bearing, dist,
-               "y" if green_found else "n", "y" if red_found else "n"))
+        kind, bearing, dist = result
+        print("survey: camera says kind=%d bearing=%d range=%d" %
+              (kind, bearing, dist))
 
-        if kind != -1:  # a sphere was found -- dead or alive both count
+        # Spheres only. kind 3/4 are the evacuation points, which are
+        # zone targets but not victims -- driving at one would be a bug,
+        # not a rescue.
+        if kind in SPHERE_KINDS:  # dark or light, either counts
             print("survey: sphere found at scan angle %d (kind=%d bearing=%d dist=%d)" %
                   (angle, kind, bearing, dist))
 
@@ -1214,8 +1289,13 @@ def hub2_goal(goal, timeout_ms=HUB2_GOAL_TIMEOUT_MS):
 
 
 def _usable_range(result):
-    """True if a query_zone_camera() reply carries both a ball and a range."""
-    return result is not None and result[1] != -1 and result[3] > 0
+    """True if a query_zone_camera() reply carries both a ball and a range.
+
+    result is (kind, bearing, range_mm) -- a ball means a SPHERE kind,
+    not merely "something was seen", since an evacuation point reports a
+    perfectly good range too and is not a thing to drive into.
+    """
+    return result is not None and result[0] in SPHERE_KINDS and result[2] > 0
 
 
 def state_A():
@@ -1223,14 +1303,36 @@ def state_A():
     camera-reported range to the ball and hand off to C."""
     robot.stop()
 
-    # Range as it stands BEFORE the claw comes down, kept as a fallback
-    # for the re-read below. A lowered lifter may well sit in the
-    # camera's line of sight to a ball on the floor; without this
-    # fallback that reads as "ball lost" -> V -> re-scan -> find the same
-    # ball -> A -> claw already down -> occluded again, which is a
-    # livelock rather than a recovery.
-    pre_lower = query_zone_camera()
+    # ONE range measurement, taken here, while the robot is still sitting
+    # where state_V() centred it and before anything else has happened.
+    # This is the only look the approach takes.
+    #
+    # It deliberately does NOT re-confirm after the claw is lowered. That
+    # re-confirmation is what made this state loop: a single empty read
+    # after the claw step sent it to V, V re-found the same ball and
+    # handed it straight back, and round it went. The ball has not moved
+    # between the two reads -- only the robot's ability to see it can
+    # have changed -- so the earlier measurement is the better number to
+    # trust anyway, not merely the safer one.
+    result = query_zone_camera()
 
+    if result is None:
+        print("approach: camera not responding")
+        return "Q"
+
+    kind, bearing, dist = result
+    if kind not in SPHERE_KINDS:
+        print("approach: no ball to approach (kind=%d)" % kind)
+        return "V"  # design.md Sec7: A -> V when the target is lost
+    if dist <= 0:
+        print("approach: no usable range to the ball")
+        return "V"
+
+    # Claw down before a wheel turns, but AFTER the range is known --
+    # lowering it mid-drive would swing the lifter through the space the
+    # ball occupies instead of arriving with it already open around it.
+    # Whatever the claw does to the camera's view from here on no longer
+    # matters, because nothing looks again.
     if not hub2_goal(GOAL_LOWER):
         # design.md Sec7 says A -> Q when blocked, and that is what this
         # should become once state Q actually does something. While Q is
@@ -1238,28 +1340,6 @@ def state_A():
         # diagnosis and looks exactly like "state A did nothing" -- so
         # press on and let the approach itself be observed instead.
         print("approach: WARNING claw would not lower, approaching anyway")
-
-    if HUB2_ENABLED:
-        wait(SCAN_SETTLE_MS)  # the lifter just moved -- let the camera
-                              # settle before trusting a frame again
-
-    result = query_zone_camera()
-    if not _usable_range(result) and _usable_range(pre_lower):
-        print("approach: nothing visible with the claw down, "
-              "using the pre-lower range")
-        result = pre_lower
-
-    if result is None:
-        print("approach: camera not responding")
-        return "Q"
-
-    count, kind, bearing, dist, green_found, red_found = result
-    if kind == -1:
-        print("approach: ball lost before driving")
-        return "V"  # design.md Sec7: A -> V when the target is lost
-    if dist <= 0:
-        print("approach: no usable range to the ball")
-        return "V"
 
     travel = dist + APPROACH_CORRECTION_MM
     print("approach: range %d mm, driving %d mm (correction %d)" %
@@ -1278,10 +1358,34 @@ def state_A():
 
 
 def state_C():
-    """CAPTURE (design.md Sec7)."""
-    # TODO -> D (grip confirmed) / A (grip failed, ball visible) /
-    #         V (grip failed, ball gone) / Q (hub 2 FAULT or timeout)
-    return None
+    """CAPTURE (design.md Sec7) -- close the claw on the ball, then raise
+    the lifter to carry height."""
+    # Nothing here drives, but state_A()'s straight() leaves the drive
+    # base holding position -- stop it rather than leaving the wheels
+    # energised through two mechanical moves.
+    robot.stop()
+
+    # Close first, raise second, and never overlapped: hub2_goal() blocks
+    # until each is DONE. Raising a claw that is still closing would lift
+    # past the ball while the jaws are still open around it.
+    if not hub2_goal(GOAL_CLOSE):
+        print("capture: claw would not close")
+        return "Q"  # design.md Sec7: C -> Q on hub 2 FAULT or timeout
+
+    if not hub2_goal(GOAL_RAISE):
+        print("capture: lifter would not raise")
+        return "Q"
+
+    print("capture: closed and raised")
+    # TODO: this reports success on "both moves completed", which is not
+    # the same as "a ball is actually held". Hub 2 already sends a grip
+    # verdict -- GRIP_EMPTY / GRIP_HOLDING / GRIP_BLOCKED -- in field 2
+    # of the very packet hub2_goal() reads the DONE phase from, and it
+    # currently throws that field away. Reading it is what would let this
+    # take design.md Sec7's other two exits: A when the grip failed but
+    # the ball is still visible, V when it failed and the ball is gone.
+    # Until then a closed-on-nothing claw still reports captured.
+    return "D"
 
 
 def state_D():
@@ -1328,16 +1432,15 @@ ZONE_STATES = {"V", "A", "C", "D", "T", "K", "Q"}
 
 def sync_camera_line_mode():
     """
-    Tell the camera to switch to LINE mode (tilts it back down). Called
-    once at the moment the FSM crosses from a zone state back into a
-    line state, not every tick -- state_F()'s own loop runs far too
-    often to afford a blocking camera.call() on every 10ms tick, unlike
-    state_V()'s own zone-mode entry, which can afford to retry-until-
-    confirmed because it only happens once per zone attempt. This is
-    just restoring the default/safe camera orientation for line-
-    following, so a single best-effort send is accepted here instead.
+    Point the camera back down for line work, by asking it a line
+    question -- there is no mode command any more, so the question IS
+    the aim. The answer is discarded; only the re-aiming matters here.
+
+    Called once at the moment the FSM crosses from a zone state back
+    into a line state, never per tick: this blocks for as long as the
+    aim takes to settle, which state_F()'s 10ms loop could not absorb.
     """
-    camera.call("mode", 0, wait_ms=5)
+    ask(QUESTION_JUNCTION, CAMERA_AIM_POLL_TRIES)
 
 # --- debug-stepped main loop -------------------------------------------------
 

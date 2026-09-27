@@ -7,9 +7,9 @@ answer, so the PUPRemote link, the question protocol and the camera's detectors
 can be exercised with no course, no hub 2 and no line following.
 
     LEFT  click         J  is the black line CONTINUING ahead?
-    RIGHT click         M  seam check - line ahead, and how much WHITE
+    RIGHT click         Z  nearest evacuation-zone target          (raises aim)
     LEFT  double click  A  is there a black line ANYWHERE ahead?  (raises aim)
-    RIGHT double click  Z  nearest evacuation-zone target          (raises aim)
+    RIGHT double click  M  seam check - line ahead, and how much WHITE
 
 Between presses it keeps polling with whatever question is current and prints
 the answer whenever it changes, so the camera's output is always on screen.
@@ -257,7 +257,7 @@ def main():
 
     print("Hub 1 camera bench test.")
     print("  LEFT  click / double  ->  J junction / A ahead")
-    print("  RIGHT click / double  ->  M seam     / Z zone")
+    print("  RIGHT click / double  ->  Z zone     / M seam")
     print("  (set STANDALONE = False in robocup_olr_cam.py)")
 
     while True:
@@ -275,9 +275,9 @@ def main():
         elif left == 2:
             asked, tries = QUESTION_AHEAD, CAMERA_AIM_POLL_TRIES
         elif right == 1:
-            asked = QUESTION_SEAM
-        elif right == 2:
             asked, tries = QUESTION_ZONE, CAMERA_AIM_POLL_TRIES
+        elif right == 2:
+            asked = QUESTION_SEAM
 
         # ---- 2. ask -------------------------------------------------------
         if asked is not None:
