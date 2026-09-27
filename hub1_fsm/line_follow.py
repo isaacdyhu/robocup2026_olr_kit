@@ -45,10 +45,49 @@ from pybricks.hubs import PrimeHub
 from pybricks.pupdevices import Motor, ColorSensor, UltrasonicSensor
 from pybricks.parameters import Port, Direction, Button
 from pybricks.robotics import DriveBase
-from pybricks.tools import wait
+from pybricks.tools import wait, StopWatch
 from pybricks.iodevices import PUPDevice
 
-hub = PrimeHub()
+# --- hub 2 link (BLE broadcast) ---------------------------------------------
+#
+# Master switch, and the reason this is a switch at all: with hub 2 off,
+# an unconditional hub2_goal() blocks for its whole timeout and then
+# reports failure, which is indistinguishable from a jammed claw and
+# leaves state A looking like it did nothing. Off means the claw steps
+# are skipped outright and the states that use them still run, so the
+# driving can be tested without hub 2 present. Turn it on once hub 2 is
+# actually running pybricks/hub2_code.py.
+HUB2_ENABLED = False
+
+# Channel numbers and goal letters are COPIES of pybricks/hub2_code.py's
+# own constants, checked against that file directly rather than taken
+# from design.md -- the doc's Sec3 describes a higher-level goal set
+# (STOW/CAPTURE/RELEASE) that hub 2 does not actually implement. What it
+# really accepts is these four primitives. Nothing enforces the match,
+# and pybricks/hub1_test_hub2.py's own header spells out how a mismatch
+# fails: hub 2 doesn't recognise the goal and reports FAULT, which looks
+# exactly like a jammed motor.
+COMMAND_CHANNEL = 1     # hub 1 -> hub 2
+STATE_CHANNEL = 2       # hub 2 -> hub 1
+
+GOAL_LOWER = "L"        # lifter down to grab height
+GOAL_CLOSE = "C"        # claw closed until it stalls, plus a grip verdict
+GOAL_RAISE = "R"        # lifter up to carry height
+GOAL_OPEN = "O"         # claw opened
+
+PHASE_DONE = "D"
+PHASE_FAULT = "F"
+
+# BLE channels can only be declared at construction, never added to an
+# existing PrimeHub -- hence the branch rather than a later call. With
+# HUB2_ENABLED off this is byte-for-byte the plain PrimeHub() this file
+# used before hub 2 existed, so everything already working (line
+# following, the scan, the obstacle bypass) is untouched by any of this.
+if HUB2_ENABLED:
+    hub = PrimeHub(broadcast_channel=COMMAND_CHANNEL,
+                   observe_channels=[STATE_CHANNEL])
+else:
+    hub = PrimeHub()
 
 left_sensor = ColorSensor(Port.A)
 right_sensor = ColorSensor(Port.E)
@@ -956,114 +995,80 @@ def query_zone_camera():
 # because only the bearing's SIGN has to be right for it to work.
 CENTRE_TOLERANCE_DEG = 7      # |bearing| at or below this counts as centred
 
-CENTRE_ROTATE_SPEED_DPS = 10  # deliberately SLOW, and the single most
-                              # important constant here. Unlike a
-                              # stop-and-measure loop, this one measures
-                              # while moving, so every reading is stale by
-                              # one camera frame plus one link round-trip
-                              # -- call it 100-200ms in ZONE mode, where
-                              # the blob work is heavy. The robot keeps
-                              # turning through that whole delay, so
-                              # overshoot is roughly
-                              #     speed x latency
-                              # (20 deg/s x 0.15 s = 3 deg, inside the
-                              # tolerance band above). IF IT OVERSHOOTS,
-                              # LOWER THIS -- do not tighten
-                              # CENTRE_TOLERANCE_DEG, which makes it worse
-                              # by narrowing the band the robot has to
-                              # catch while sailing past at the same rate.
-CENTRE_MAX_SWEEP_DEG = 90     # safety cap on total rotation: give up
-                              # rather than spin forever if the bearing
-                              # never reaches zero (ball rolled out of
-                              # frame, bearing sign convention inverted,
-                              # camera stuck on a stale frame)
+CENTRE_ROTATE_SPEED_DPS = 40  # can be brisk: the robot is STOPPED every
+                              # time it measures, so rotation speed no
+                              # longer blurs or stales the reading the way
+                              # it did when this turned and polled at once.
+CENTRE_MAX_STEP_DEG = 45      # cap on any single correction, so one wild
+                              # bearing reading can't swing the robot
+                              # straight past the ball it was aiming at
+CENTRE_MAX_STEPS = 12         # give up rather than shuffle forever if the
+                              # bearing never converges (ball rolled out
+                              # of frame, bearing sign inverted, camera
+                              # stuck on a stale frame). Each step costs a
+                              # SCAN_SETTLE_MS pause, so this is a real
+                              # time budget as well as a safety net -- 12
+                              # of them is ~18s worst case. Back to 12 to
+                              # match the version that was tracking the
+                              # ball reliably; drop it again if a genuine
+                              # competition run can't spare that long on a
+                              # ball it is never going to converge on.
 
 
 def centre_on_ball():
     """
-    Turn slowly toward the ball in one continuous motion, polling the
-    camera throughout, and stop once it reports the ball within
-    CENTRE_TOLERANCE_DEG of dead ahead.
+    Turn toward the ball in steps, STOPPING to measure between each, until
+    the camera reports it within CENTRE_TOLERANCE_DEG of dead ahead.
 
-    Two stop conditions, not one. The obvious one is the bearing landing
-    inside the tolerance band. The second is the bearing CHANGING SIGN
-    between two polls -- that means the ball crossed dead-ahead somewhere
-    in the gap between those readings, and without catching it the robot
-    would carry on turning away from a ball it has already passed. With
-    stale readings and a finite poll rate, that case is not an edge case;
-    it is what happens whenever the band is crossed faster than it is
-    sampled.
+    Stop-and-measure, not measure-while-turning, and that distinction is
+    the whole point. SCAN_SETTLE_MS in this same file is 1500ms -- that is
+    how long the scan was found to need, standing still, before the camera
+    returns a detection worth trusting. An earlier version of this rotated
+    continuously and polled as it went, which gave the camera no still
+    time at all: it reported no ball (kind == -1) and this bailed out with
+    "ball lost mid-turn" every time. Rotation speed was never the problem
+    and slowing it down did not fix it -- the camera needs stillness, not
+    gentleness.
 
-    Returns True once centred (either way), False if the ball was lost,
-    the camera stopped answering, or the sweep cap was hit.
+    Each correction is the full measured bearing (clamped to
+    CENTRE_MAX_STEP_DEG) rather than a small fixed nudge, because every
+    measurement costs that 1500ms settle: converging in one or two big
+    steps is far quicker than creeping there in ten small ones.
+
+    Returns True once centred, False if the ball was lost, the camera
+    stopped answering, or the step budget ran out.
     """
-    result = query_zone_camera()
-    if result is None:
-        print("centre: camera not responding")
-        return False
-
-    count, kind, bearing, dist, green_found, red_found = result
-    if kind == -1:
-        print("centre: no ball to centre on")
-        return False
-
-    if abs(bearing) <= CENTRE_TOLERANCE_DEG:
-        print("centre: already centred at bearing %d" % bearing)
-        return True
-
-    # Positive bearing = ball right of centre -> turn right (clockwise),
-    # which is +1 in this file's convention throughout. The wheel speeds
-    # below are just rotate_to_heading()'s own in-place-spin case
-    # (pivot_offset 0) written out directly: left forward, right back.
-    turn_sign = 1 if bearing > 0 else -1
-    start_heading = hub.imu.heading()
-    print("centre: bearing %d, turning %s" %
-          (bearing, "right" if turn_sign > 0 else "left"))
-
-    left_motor.run(turn_sign * CENTRE_ROTATE_SPEED_DPS)
-    right_motor.run(-turn_sign * CENTRE_ROTATE_SPEED_DPS)
-
-    while True:
-        if abs(hub.imu.heading() - start_heading) >= CENTRE_MAX_SWEEP_DEG:
-            left_motor.stop()
-            right_motor.stop()
-            print("centre: swept %d deg without centring, giving up" %
-                  CENTRE_MAX_SWEEP_DEG)
-            return False
-
-        # No explicit wait between polls: query_zone_camera() already
-        # costs a link round-trip, and every millisecond added here is
-        # another millisecond of rotation the reading doesn't know about.
+    for step in range(CENTRE_MAX_STEPS):
+        # Always measured stationary -- on the first pass the robot is
+        # still settled from the scan's own pause, and on every later pass
+        # from this loop's own settle after rotating.
         result = query_zone_camera()
         if result is None:
-            left_motor.stop()
-            right_motor.stop()
-            print("centre: camera stopped responding mid-turn")
+            print("centre: camera not responding")
             return False
 
         count, kind, bearing, dist, green_found, red_found = result
 
         if kind == -1:
-            left_motor.stop()
-            right_motor.stop()
-            print("centre: ball lost mid-turn")
+            print("centre: no ball visible at step %d" % step)
             return False
 
         if abs(bearing) <= CENTRE_TOLERANCE_DEG:
-            left_motor.stop()
-            right_motor.stop()
-            print("centre: centred at bearing %d" % bearing)
+            print("centre: centred at bearing %d after %d step(s)" % (bearing, step))
             return True
 
-        if (bearing > 0) != (turn_sign > 0):
-            # Sign flipped: the ball crossed dead-ahead between polls.
-            # Stop now -- still turning would walk away from it. The
-            # printed bearing is how far past centre it got, which is the
-            # number to watch if CENTRE_ROTATE_SPEED_DPS needs lowering.
-            left_motor.stop()
-            right_motor.stop()
-            print("centre: passed centre, stopped at bearing %d" % bearing)
-            return True
+        # Positive bearing = ball right of centre -> turn right
+        # (clockwise), which is +1 in this file's convention throughout.
+        correction = max(-CENTRE_MAX_STEP_DEG, min(CENTRE_MAX_STEP_DEG, bearing))
+        print("centre: bearing %d, correcting by %d" % (bearing, correction))
+        rotate_to_heading(0, hub.imu.heading() + correction, CENTRE_ROTATE_SPEED_DPS)
+
+        # The settle that makes the NEXT measurement trustworthy -- the
+        # entire reason this loop stops instead of turning continuously.
+        wait(SCAN_SETTLE_MS)
+
+    print("centre: gave up after %d steps" % CENTRE_MAX_STEPS)
+    return False
 
 
 def state_V():
@@ -1135,10 +1140,141 @@ def state_V():
     return None
 
 
+# --- approach (design.md Sec7 "APPROACH (state A)") --------------------------
+
+HUB2_GOAL_TIMEOUT_MS = 5000   # give up on a hub-2 goal after this long.
+                              # Only reachable with HUB2_ENABLED on; a hub
+                              # that never answers and one stuck MOVING
+                              # forever look identical from here, since
+                              # both simply fail to ever say DONE.
+HUB2_POLL_MS = 10             # matches hub 2's own broadcast cadence
+
+APPROACH_SPEED_MM_S = 80      # mm/s for the drive-up
+
+APPROACH_CORRECTION_MM = -60  # SIGNED adjustment added to the camera's
+                              # reported range to get the distance actually
+                              # driven. Negative because the camera reports
+                              # range from its own mounting point, but the
+                              # robot wants to stop with the ball inside the
+                              # claw -- which sits ahead of the wheel centre
+                              # that robot.straight() moves. Tune against
+                              # real behaviour: stops short -> make this LESS
+                              # negative; drives into/past the ball -> MORE
+                              # negative. Untested placeholder.
+
+_hub2_seq = 0  # incremented per goal, so hub 2 can tell a fresh request
+               # from a resend of the one it is already working on
+
+
+def hub2_goal(goal, timeout_ms=HUB2_GOAL_TIMEOUT_MS):
+    """
+    Send one goal to hub 2 and block until it echoes that goal DONE.
+    Returns True on DONE, False on FAULT or timeout.
+
+    Returns True immediately when HUB2_ENABLED is off -- "nothing is
+    blocking you", so callers carry on with the rest of their sequence
+    rather than treating a deliberately-absent hub 2 as a failure.
+
+    One broadcast is enough, not a resend loop: Pybricks' broadcast()
+    sets what this hub continuously advertises and keeps advertising it
+    until changed, so the goal stays on the air as a level for the whole
+    wait -- the same "levels, not verbs" reasoning design.md Sec3 gives
+    for the link as a whole.
+
+    Matching on seq is load-bearing. Hub 2 rebroadcasts its state every
+    10ms regardless, so without the seq check this would immediately read
+    a DONE left over from the PREVIOUS goal and return before the new one
+    had moved anything at all.
+    """
+    if not HUB2_ENABLED:
+        print("hub2: disabled, skipping goal %s" % goal)
+        return True
+
+    global _hub2_seq
+    _hub2_seq += 1
+    seq = _hub2_seq
+    hub.ble.broadcast((seq, goal))
+
+    timer = StopWatch()
+    while timer.time() < timeout_ms:
+        state = hub.ble.observe(STATE_CHANNEL)
+        # observe() returns None when nothing has been heard recently;
+        # anything carrying a stale seq is left over from a previous goal.
+        if state is not None and len(state) >= 2 and state[0] == seq:
+            phase = state[1]
+            if phase == PHASE_DONE:
+                return True
+            if phase == PHASE_FAULT:
+                print("hub2: goal %s reported FAULT" % goal)
+                return False
+        wait(HUB2_POLL_MS)
+
+    print("hub2: goal %s timed out after %d ms" % (goal, timeout_ms))
+    return False
+
+
+def _usable_range(result):
+    """True if a query_zone_camera() reply carries both a ball and a range."""
+    return result is not None and result[1] != -1 and result[3] > 0
+
+
 def state_A():
-    """APPROACH (design.md Sec7)."""
-    # TODO -> C (within capture range) / V (target lost) / Q (blocked)
-    return None
+    """APPROACH (design.md Sec7) -- lower the claw, then drive the
+    camera-reported range to the ball and hand off to C."""
+    robot.stop()
+
+    # Range as it stands BEFORE the claw comes down, kept as a fallback
+    # for the re-read below. A lowered lifter may well sit in the
+    # camera's line of sight to a ball on the floor; without this
+    # fallback that reads as "ball lost" -> V -> re-scan -> find the same
+    # ball -> A -> claw already down -> occluded again, which is a
+    # livelock rather than a recovery.
+    pre_lower = query_zone_camera()
+
+    if not hub2_goal(GOAL_LOWER):
+        # design.md Sec7 says A -> Q when blocked, and that is what this
+        # should become once state Q actually does something. While Q is
+        # still a blank stub, dead-ending there strands the robot with no
+        # diagnosis and looks exactly like "state A did nothing" -- so
+        # press on and let the approach itself be observed instead.
+        print("approach: WARNING claw would not lower, approaching anyway")
+
+    if HUB2_ENABLED:
+        wait(SCAN_SETTLE_MS)  # the lifter just moved -- let the camera
+                              # settle before trusting a frame again
+
+    result = query_zone_camera()
+    if not _usable_range(result) and _usable_range(pre_lower):
+        print("approach: nothing visible with the claw down, "
+              "using the pre-lower range")
+        result = pre_lower
+
+    if result is None:
+        print("approach: camera not responding")
+        return "Q"
+
+    count, kind, bearing, dist, green_found, red_found = result
+    if kind == -1:
+        print("approach: ball lost before driving")
+        return "V"  # design.md Sec7: A -> V when the target is lost
+    if dist <= 0:
+        print("approach: no usable range to the ball")
+        return "V"
+
+    travel = dist + APPROACH_CORRECTION_MM
+    print("approach: range %d mm, driving %d mm (correction %d)" %
+          (dist, travel, APPROACH_CORRECTION_MM))
+
+    if travel > 0:
+        robot.settings(straight_speed=APPROACH_SPEED_MM_S)
+        robot.straight(travel)
+    else:
+        # The correction alone already covers the whole measured range,
+        # so the ball should be in the claw already. Driving a negative
+        # distance here would reverse away from it.
+        print("approach: already within the correction distance, not driving")
+
+    return "C"
 
 
 def state_C():

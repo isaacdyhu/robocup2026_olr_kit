@@ -1,264 +1,310 @@
-#!/usr/bin/env pybricks-micropython
 """
-pybricks/hub_camera_test.py -- test the Hub 1 <-> camera PUPRemote link.
+Bench test - hub 1 side of the camera link (SPIKE Prime / Pybricks).
 
-Left button -> zone mode off (LINE mode). Right button -> zone mode on
-(ZONE mode). Sends whichever one is currently selected on every loop
-tick, not just once on the button press -- a level, not an edge-triggered
-event, matching design.md Sec3's reasoning for the whole hub1<->hub2
-protocol (broadcast/polled links are lossy, so a repeated level survives
-a dropped message where a one-shot command wouldn't; the same logic
-applies here even though this is a polled call rather than BLE
-broadcast).
+Runs on HUB 1, with robocup_olr_cam.py running on the OpenMV camera. Puts each
+of the four questions to the camera from hub 1's own buttons and prints every
+answer, so the PUPRemote link, the question protocol and the camera's detectors
+can be exercised with no course, no hub 2 and no line following.
 
-Camera on port D (design.md's Hub 1 table).
+    LEFT  click         J  is the black line CONTINUING ahead?
+    RIGHT click         M  seam check - line ahead, and how much WHITE
+    LEFT  double click  A  is there a black line ANYWHERE ahead?  (raises aim)
+    RIGHT double click  Z  nearest evacuation-zone target          (raises aim)
 
-SELF-CONTAINED, DELIBERATELY: this used to `from pupremote_hub import
-PUPRemoteHub`, relying on Pybricks Code auto-bundling a second local
-file. Checked directly against pybricks/support#189 on GitHub -- that
-"magic" multi-file bundling is confirmed beta-only (Pybricks Code Beta
-or the pybricksdev CLI), and stable code.pybricks.com's own release
-history has no mention of it ever landing there. Since this project is
-being run from stable code.pybricks.com, the PUPRemoteHub class itself
-(from github.com/antonvh/PUPRemote's pupremote_hub.py, GPL-licensed) is
-copied in below instead, so there is no cross-file import to fail.
+Between presses it keeps polling with whatever question is current and prints
+the answer whenever it changes, so the camera's output is always on screen.
 
-lpf2.py is NOT needed here and was removed from pybricks/ -- checked
-directly against pupremote_hub.py's own source: it has zero references
-to lpf2 anywhere, since the hub side talks over the link via Pybricks'
-own built-in PUPDevice class (pybricks.iodevices), not a separate LPF2
-implementation. lpf2.py is only needed on the OpenMV/camera side
-(openmv_lib/), which uses the fuller pupremote.py instead.
+*** SET STANDALONE = False in robocup_olr_cam.py *** - with it True the camera
+holds its own question and ignores the hub, and every query here will time out.
 
-UNTESTED END TO END: this and camera.py's "mode" command have never
-actually been run together. add_command()'s name and both format
-strings below must match camera.py's "mode" registration exactly, or
-the two sides won't agree on how to interpret the bytes on the wire.
+This is a TEST program, not part of the run. robocup_olr_hub1.py is untouched.
+
+
+WHY THE POLLING LOOKS LIKE THIS
+-------------------------------
+The link is not request-response. PUPRemote is a shared variable: the camera
+computes an answer from the frame it has already taken and the hub reads
+whatever was last put on the wire. So the first read after asking a NEW question
+is always stale - it answers the PREVIOUS question.
+
+Every request therefore carries a sequence byte the camera echoes, and the hub
+polls until the echo matches. This script prints the polls it discards as well
+as the one it accepts, because how many were discarded is the interesting number
+when something is wrong.
+
+Questions that move the camera ('A' and 'Z' tilt it up) need a far longer budget
+than the others: the camera deliberately WITHHOLDS the echo until the servo has
+settled, so until then every poll looks stale. A budget shorter than the
+camera's settle time turns a perfectly healthy camera into "unreachable".
 """
-
-# --- vendored from github.com/antonvh/PUPRemote (pupremote_hub.py, GPL) ----
-#
-# Trimmed to just what this script uses: PUPRemote/PUPRemoteHub and
-# call()/add_command(). The multitask/async methods (call_multitask(),
-# process_async()) are left out entirely, not merely unused, since this
-# script only ever uses the plain synchronous call() -- see call()'s own
-# assertion that it must NOT be used from inside a multitask context.
-# Type hints referencing `Any` (never imported in the original file
-# either) are dropped rather than trusted to be silently ignored.
-
-import ustruct as struct
-from pybricks.iodevices import PUPDevice
-from pybricks.tools import wait, run_task
-from micropython import const
-
-MAX_PKT = const(16)
-
-NAME = const(0)
-SIZE = const(1)
-TO_HUB_FORMAT = const(2)
-FROM_HUB_FORMAT = const(3)
-ARGS_TO_HUB = const(5)
-ARGS_FROM_HUB = const(6)
-CALLBACK = const(0)
-CHANNEL = const(1)
-
-
-class PUPRemote:
-    """Base class for PUPRemoteHub. Defines commands/formats and the
-    encode/decode functions shared with the sensor side."""
-
-    def __init__(self, max_packet_size=MAX_PKT):
-        self.commands = []
-        self.modes = {}
-        self.max_packet_size = max_packet_size
-
-    def add_command(self, mode_name, to_hub_fmt="", from_hub_fmt="", command_type=CALLBACK):
-        if to_hub_fmt == "repr" or from_hub_fmt == "repr":
-            msg_size = self.max_packet_size
-            num_args_from_hub = -1
-            num_args_to_hub = -1
-        else:
-            size_to_hub_fmt = struct.calcsize(to_hub_fmt)
-            size_from_hub_fmt = struct.calcsize(from_hub_fmt)
-            msg_size = max(size_to_hub_fmt, size_from_hub_fmt)
-            num_args_to_hub = len(
-                struct.unpack(to_hub_fmt, bytearray(struct.calcsize(to_hub_fmt)))
-            )
-            num_args_from_hub = len(
-                struct.unpack(from_hub_fmt, bytearray(struct.calcsize(from_hub_fmt)))
-            )
-
-        assert msg_size <= self.max_packet_size, "Payload exceeds maximum packet size"
-        self.commands.append({
-            NAME: mode_name,
-            TO_HUB_FORMAT: to_hub_fmt,
-            SIZE: msg_size,
-            ARGS_TO_HUB: num_args_to_hub,
-        })
-        if command_type == CALLBACK:
-            self.commands[-1][FROM_HUB_FORMAT] = from_hub_fmt
-            self.commands[-1][ARGS_FROM_HUB] = num_args_from_hub
-
-        self.modes[mode_name] = len(self.commands) - 1
-
-    def decode(self, fmt, data):
-        if fmt == "repr":
-            clean = data.rstrip(b"\x00")
-            return (eval(clean),) if clean else ("",)
-        else:
-            size = struct.calcsize(fmt)
-            data = struct.unpack(fmt, data[:size])
-        return data
-
-    def encode(self, size, format, *argv):
-        if format == "repr":
-            s = bytes(repr(*argv), "UTF-8")
-        else:
-            s = struct.pack(format, *argv)
-        assert len(s) <= size, "Payload exceeds maximum packet size"
-        return s
-
-
-class PUPRemoteHub(PUPRemote):
-    """Communicate with a PUPRemoteSensor from a Pybricks hub. `port` is
-    where the PUPRemoteSensor is connected (e.g. Port.D)."""
-
-    def __init__(self, port, max_packet_size=MAX_PKT):
-        super().__init__(max_packet_size)
-        # Upstream bug fixed here, confirmed against the real source
-        # (github.com/antonvh/PUPRemote's pupremote_hub.py) -- it has
-        # this exact same "if str / if int-else" structure, which only
-        # ever sets self.port in the else branch. Called with a string
-        # ("D") or a raw int (4) instead of Port.D directly, self.port
-        # would stay unset, and the except block below would throw its
-        # own AttributeError trying to print it -- masking the real
-        # OSError entirely. Not the cause of this file's actual "not
-        # connected" error (this script always calls PUPRemoteHub with
-        # Port.D directly, which isn't a str or an int, so self.port was
-        # already being set correctly on that specific path) -- fixed
-        # anyway since it's latent and this class may get reused
-        # elsewhere with a different-typed port argument.
-        if isinstance(port, str):
-            port = eval("Port." + port)
-        elif isinstance(port, int):
-            port = eval("Port." + chr(64 + port))
-        self.port = port
-        try:
-            self.pup_device = PUPDevice(port)
-        except OSError:
-            self.pup_device = None
-            print("Check wiring and remote script. Unable to connect on ", self.port)
-            raise
-
-    def add_command(self, mode_name, to_hub_fmt="", from_hub_fmt="", command_type=CALLBACK):
-        super().add_command(mode_name, to_hub_fmt, from_hub_fmt, command_type)
-        # Check the newly added command against what the sensor side advertises.
-        modes = self.pup_device.info()["modes"]
-        n = len(self.commands) - 1
-        assert len(self.commands) <= len(modes), "More commands than on remote side"
-        assert mode_name == modes[n][0].rstrip(), (
-            "Expected '{}' as mode {}, but got '{}'".format(modes[n][0].rstrip(), n, mode_name)
-        )
-        assert self.commands[-1][SIZE] == modes[n][1], (
-            "Different parameter size than on remote side. Check formats."
-        )
-
-    def call(self, mode_name, *argv, wait_ms=0):
-        """Call a remote function on the sensor side, wait_ms before
-        reading the reply back. Must not be used from a multitask
-        context (not supported here at all -- see the file header)."""
-        assert not run_task(), "Use 'call_multitask' instead of 'call', with multiple start blocks or multitask blocks"
-
-        mode = self.modes[mode_name]
-        size = self.commands[mode][SIZE]
-
-        if FROM_HUB_FORMAT in self.commands[mode]:
-            num_args = self.commands[mode][ARGS_FROM_HUB]
-            if num_args >= 0:
-                assert len(argv) == num_args, (
-                    "Expected {} argument(s) in call '{}'".format(num_args, mode_name)
-                )
-            self.pup_device.read(mode)
-            payl = self.encode(size, self.commands[mode][FROM_HUB_FORMAT], *argv)
-            self.pup_device.write(
-                mode,
-                [((i + 128) & 0xFF) - 128 for i in tuple(payl + b"\x00" * (size - len(payl)))],
-            )
-            wait(wait_ms)
-
-        data = self.pup_device.read(mode)
-        raw_data = bytes([b if b >= 0 else b + 256 for b in data])
-        result = self.decode(self.commands[mode][TO_HUB_FORMAT], raw_data)
-        return result[0] if len(result) == 1 else result
-
-
-# --- this project's own code -------------------------------------------
 
 from pybricks.hubs import PrimeHub
 from pybricks.parameters import Button, Port
-from pybricks.tools import wait
+from pybricks.tools import StopWatch, wait
+
+from pupremote_hub import PUPRemoteHub
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+CAMERA_PORT = Port.D
+
+LOOP_MS = 10
+DOUBLE_CLICK_MS = 350
+
+# ---- Copied from robocup_olr_hub1.py / robocup_olr_cam.py -------------------
+# Nothing enforces any of this. A mismatch does not raise - it silently produces
+# a plausible wrong answer, or a timeout that looks like dead hardware.
+QUESTION_JUNCTION = ord('J')
+QUESTION_SEAM = ord('M')
+QUESTION_AHEAD = ord('A')
+QUESTION_ZONE = ord('Z')
+
+KIND_NAMES = {0: "nothing", 1: "DARK sphere", 2: "LIGHT sphere",
+              3: "GREEN point", 4: "RED point"}
+
+CAMERA_CONNECT_TRIES = 10
+CAMERA_WAIT_MS = 6              # PUPRemote call timeout
+
+CAMERA_POLL_TRIES = 10
+CAMERA_POLL_GAP_MS = 30
+
+# MUST EXCEED robocup_olr_cam.py's TILT_MOVE_MS + TILT_SETTLE_MS, or an aim
+# change is indistinguishable from an absent camera. At the time of writing
+# those are 500 + 200, and this is 1000.
+CAMERA_AIM_SETTLE_MS = 1000
+CAMERA_AIM_POLL_TRIES = CAMERA_AIM_SETTLE_MS // CAMERA_POLL_GAP_MS + 10
+
+# How often to say something while waiting out a long settle, in polls. Without
+# it an 'A' or 'Z' looks like a three-second hang.
+PROGRESS_EVERY = 10
+
+# ============================================================================
+# HARDWARE
+# ============================================================================
 
 hub = PrimeHub()
+clock = StopWatch()
 
-# to_hub_fmt/from_hub_fmt must match camera.py's add_command("mode", ...)
-# exactly -- same name, same two format strings, on both sides. The reply
-# is 8 shorts; f2..f7 mean different things depending on echoed_mode, per
-# camera.py's own comment above its "mode" registration:
-#   LINE (echoed_mode=0): ahead, angle, length, coverage, bg_code, unused
-#   ZONE (echoed_mode=1): sphere_count, nearest_kind, nearest_bearing,
-#                         nearest_dist_mm, green_found, red_found
-#   -- of however many spheres are in frame, those three describe the
-#   NEAREST one; sphere_count says how many there really were.
-camera = PUPRemoteHub(Port.D)
-camera.add_command("mode", to_hub_fmt="hhhhhhhh", from_hub_fmt="b")
 
-BACKGROUND_NAME = ["black", "white", "unclear"]
-SPHERE_KIND_NAME = {-1: "none", 0: "dead", 1: "live"}
+def connect_camera():
+    """Connect and register 'look'. Retried, so start-up order does not matter.
 
-zone_mode = False  # local desired state -- starts in LINE mode
+    Until robocup_olr_cam.py is running and advertising 'look', the port
+    presents its default modes and add_command fails.
+    """
+    for attempt in range(CAMERA_CONNECT_TRIES):
+        try:
+            cam = PUPRemoteHub(CAMERA_PORT)
+            # Must match the camera side exactly. The 8-byte reply is a power of
+            # two deliberately - a non-power-of-two payload makes an invalid
+            # LPF2 frame and crashes the sensor.
+            cam.add_command('look', to_hub_fmt="hhhh", from_hub_fmt="4s")
+            print("Camera connected on port %s." % CAMERA_PORT)
+            return cam
+        except Exception as error:
+            print("Waiting for the OpenMV 'look' client (%d): %s"
+                  % (attempt + 1, error))
+            wait(500)
 
-while True:
-    pressed = hub.buttons.pressed()
+    print("No camera found. Is robocup_olr_cam.py running?")
+    return None
 
-    if Button.LEFT in pressed:
-        zone_mode = False
-    elif Button.RIGHT in pressed:
-        zone_mode = True
 
-    # wait_ms: small delay between writing the command and reading the
-    # reply back, per PUPRemoteHub.call()'s own docstring suggestion
-    # (roughly struct.calcsize(from_hub_fmt) * 1.5) -- without it there's
-    # a real chance of reading back whatever the camera last had queued
-    # before this call's write actually lands.
-    echoed_mode, heartbeat, f2, f3, f4, f5, f6, f7 = camera.call(
-        "mode", 1 if zone_mode else 0, wait_ms=5
-    )
+# ============================================================================
+# CLICK DETECTION
+# ============================================================================
 
-    # This is sent as a level every tick, not a one-shot event (design.md
-    # Sec3's "levels, not verbs" reasoning for the whole hub1<->hub2 link
-    # applies here too) -- if the camera hasn't caught this particular
-    # write yet, echoed_mode will still show the OLD mode for a tick or
-    # two, and the next resend will just try again on its own. Printing
-    # that explicitly instead of only ever showing the current reply
-    # means a genuinely slow switch is visible as "switching..." rather
-    # than looking identical to a working one that just hasn't been
-    # pressed differently yet.
-    if echoed_mode != (1 if zone_mode else 0):
-        print("(switching... camera hasn't caught the last change yet)")
+class ClickCounter:
+    """Turns presses of one button into single and double clicks.
 
-    if echoed_mode == 0:
-        ahead, angle, length, coverage, bg_code = f2, f3, f4, f5, f6
-        bg_name = BACKGROUND_NAME[bg_code] if 0 <= bg_code <= 2 else "?"
-        # tracking follows the opposite colour to the background, same
-        # rule camera.py itself uses -- derived here rather than sent,
-        # since it doesn't need its own field.
-        label = "WHT" if bg_name == "black" else "BLK"
-        print("%s ahead=%d angle=%d len=%d cov=%d%% | background: %s" %
-              (label, ahead, angle, length, coverage, bg_name))
-    else:
-        count, kind, bearing, dist, green_found, red_found = f2, f3, f4, f5, f6, f7
-        print("ZONE spheres=%d nearest=%s bearing=%ddeg dist=%dmm green=%s red=%s" %
-              (count, SPHERE_KIND_NAME.get(kind, "?"), bearing, dist,
-               "y" if green_found else "n", "y" if red_found else "n"))
+    Polled, never blocking. A double click fires on the second PRESS, since
+    nothing more needs to be known by then; a single click fires only once the
+    gap expires AND the button is up, so a hold does nothing until released.
+    """
 
-    wait(50)
+    def __init__(self, button):
+        self.button = button
+        self.was_down = False
+        self.presses = 0
+        self.deadline = 0
+
+    def update(self, pressed_now, now):
+        """0 nothing yet, 1 single click, 2 double click."""
+        down = self.button in pressed_now
+        # Edge, not level: at LOOP_MS = 10 a held button is "pressed" on a
+        # hundred consecutive cycles.
+        new_press = down and not self.was_down
+        self.was_down = down
+
+        if new_press:
+            self.presses += 1
+            self.deadline = now + DOUBLE_CLICK_MS
+            if self.presses >= 2:
+                self.presses = 0
+                return 2
+            return 0
+
+        if self.presses == 1 and not down and now >= self.deadline:
+            self.presses = 0
+            return 1
+
+        return 0
+
+
+# ============================================================================
+# READING THE REPLY
+# ============================================================================
+# The four fields mean different things per question, which is the part of this
+# protocol most likely to be misread. One place decides.
+
+def describe(question, reply):
+    """The camera's (echo, a, b, c) spelled out for the question that asked."""
+    _echo, first, second, third = reply
+
+    if question == QUESTION_ZONE:
+        return ("kind=%s bearing=%+d deg range=%d mm"
+                % (KIND_NAMES.get(first, "?%d" % first), second, third))
+
+    what = "LINE AHEAD" if first == 1 else "no line   "
+    unit = "white" if question == QUESTION_SEAM else "black"
+    return "%s angle=%+d deg %s=%d%%" % (what, second, unit, third)
+
+
+# ============================================================================
+# ASKING
+# ============================================================================
+
+_seq = 0
+
+
+def ask(camera, question, tries):
+    """Put `question` to the camera and wait for an answer computed FOR IT.
+
+    Returns the raw (echo, a, b, c), or None. Prints the discarded polls as
+    well as the accepted one - a question that needed 3 polls and one that
+    needed 40 are both "working", but only one of them is healthy.
+    """
+    global _seq
+
+    if camera is None:
+        return None
+
+    _seq = (_seq + 1) & 0xFF
+    # Byte 2 is the kind filter, used by 'Z' only. 0 means "whatever is
+    # nearest"; set it to a KIND_* to hunt one target type.
+    request = bytes((question, _seq, 0, 0))
+
+    for attempt in range(tries):
+        try:
+            reply = camera.call('look', request, wait_ms=CAMERA_WAIT_MS)
+        except Exception as error:
+            print("  %s query FAILED: %s" % (chr(question), error))
+            return None
+
+        if reply[0] == _seq:
+            print("  %s answered after %d poll%s: %s"
+                  % (chr(question), attempt + 1, "" if attempt == 0 else "s",
+                     describe(question, reply)))
+            return reply
+
+        if attempt and attempt % PROGRESS_EVERY == 0:
+            # Not an error yet. 'A' and 'Z' move the servo, and the camera
+            # withholds its echo until it has settled.
+            print("  %s still settling (%d polls, echo=%d want %d)"
+                  % (chr(question), attempt, reply[0], _seq))
+
+        wait(CAMERA_POLL_GAP_MS)
+
+    print("  %s NEVER ECHOED seq %d after %d polls (%d ms)"
+          % (chr(question), _seq, tries, tries * CAMERA_POLL_GAP_MS))
+    return None
+
+
+def watch(camera, question):
+    """One poll with the CURRENT question, keeping the link warm.
+
+    Re-sends the question rather than a fixed one, so the camera stays pointed
+    where the last button press put it. It does NOT advance the sequence byte,
+    so nothing here is treated as a fresh question.
+
+    The link goes stale after about a second without traffic and then costs a
+    slow reconnect, so this has to run even when nothing is being asked.
+    """
+    if camera is None:
+        return None
+    try:
+        return camera.call('look', bytes((question, _seq, 0, 0)),
+                           wait_ms=CAMERA_WAIT_MS)
+    except Exception:
+        return None             # a dropped poll is not worth reporting
+
+
+# ============================================================================
+# MAIN LOOP
+# ============================================================================
+
+def main():
+    camera = connect_camera()
+
+    left_clicks = ClickCounter(Button.LEFT)
+    right_clicks = ClickCounter(Button.RIGHT)
+
+    question = QUESTION_JUNCTION
+    last_shown = None
+    quiet_since = clock.time()
+
+    print("Hub 1 camera bench test.")
+    print("  LEFT  click / double  ->  J junction / A ahead")
+    print("  RIGHT click / double  ->  M seam     / Z zone")
+    print("  (set STANDALONE = False in robocup_olr_cam.py)")
+
+    while True:
+        now = clock.time()
+
+        # ---- 1. buttons ---------------------------------------------------
+        pressed = hub.buttons.pressed()
+        left = left_clicks.update(pressed, now)
+        right = right_clicks.update(pressed, now)
+
+        asked = None
+        tries = CAMERA_POLL_TRIES
+        if left == 1:
+            asked = QUESTION_JUNCTION
+        elif left == 2:
+            asked, tries = QUESTION_AHEAD, CAMERA_AIM_POLL_TRIES
+        elif right == 1:
+            asked = QUESTION_SEAM
+        elif right == 2:
+            asked, tries = QUESTION_ZONE, CAMERA_AIM_POLL_TRIES
+
+        # ---- 2. ask -------------------------------------------------------
+        if asked is not None:
+            question = asked
+            hub.display.char(chr(question))
+            print("%d  ask %s" % (now, chr(question)))
+            ask(camera, question, tries)
+            last_shown = None           # re-print the stream after an answer
+            quiet_since = clock.time()
+
+        # ---- 3. keep listening --------------------------------------------
+        # On CHANGE, not per poll. The camera recomputes every frame and the
+        # answer is usually the same one; a line per poll would bury the
+        # transitions that matter.
+        reply = watch(camera, question)
+        if reply is not None:
+            shown = describe(question, reply)
+            if shown != last_shown:
+                last_shown = shown
+                print("%d  %s: %s" % (now, chr(question), shown))
+            quiet_since = now
+        elif now - quiet_since > 2000:
+            print("%d  camera is not answering" % now)
+            quiet_since = now
+
+        wait(LOOP_MS)
+
+
+if __name__ == "__main__":
+    main()
