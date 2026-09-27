@@ -474,6 +474,36 @@ def drive_until_black(sensor, max_distance_mm, speed_mm_s):
         wait(OBSTACLE_REJOIN_POLL_MS)
 
 
+def _wrap180(deg):
+    """Fold an angle into -180..180.
+
+    Needed because hub.imu.heading() accumulates without wrapping -- after
+    enough turns around the zone it can read several hundred degrees, and
+    a raw subtraction against a fixed angle would then pick the wrong
+    alignment entirely, or unwind those whole turns to reach it.
+    """
+    while deg > 180:
+        deg -= 360
+    while deg < -180:
+        deg += 360
+    return deg
+
+
+def rotate_to_relative(base, rel_deg, speed_dps):
+    """Rotate to `rel_deg` off `base`, always taking the short way round.
+
+    rotate_to_heading() takes an ABSOLUTE heading, and hub.imu.heading()
+    accumulates without wrapping, so `base + rel` can sit a whole
+    revolution away from where the robot actually is even though it names
+    the same direction. Handing that straight over would have the robot
+    unwind the difference. Turning by the wrapped delta instead never
+    moves more than 180 degrees.
+    """
+    current_rel = _wrap180(hub.imu.heading() - base)
+    rotate_to_heading(0, hub.imu.heading() + _wrap180(rel_deg - current_rel),
+                      speed_dps)
+
+
 def rotate_to_heading(pivot_offset_mm, target_heading_deg, speed_dps):
     """
     Rotate about pivot_offset_mm (same signed convention as
@@ -1187,25 +1217,42 @@ def state_V():
 
     global _zone_heading0
 
-    heading0 = hub.imu.heading()  # scan angles below are relative to this
-    # Kept for state_D(): once a ball has been found and captured the
-    # robot is left pointing at wherever that ball was, which is no use
-    # as a reference for the NEXT sweep. This is the heading the zone was
-    # entered on, and it is what the evacuation-point survey measures its
-    # own angles against.
-    _zone_heading0 = heading0
+    # Anchored ONCE per zone visit, not per survey. state_D() measures its
+    # sweep off this, and the post-delivery scan below measures a back
+    # bearing off it too -- re-reading it on a later survey would reset
+    # the reference to wherever the last delivery left the robot standing
+    # and quietly invalidate both.
+    if _zone_heading0 is None:
+        _zone_heading0 = hub.imu.heading()
+        print("survey: zone entry heading %d" % _zone_heading0)
+    base = _zone_heading0
+
+    # Where the sweep is centred. The first survey of a visit looks
+    # straight out from the entry heading. Every survey AFTER a delivery
+    # looks back out of the corner the ball was just placed in: state_T()
+    # squared up to one of the zone's edges to release, so facing 180
+    # from that points back across the zone, where any remaining victims
+    # are. Scanning +/-70 about the old entry heading instead would spend
+    # half the sweep pointed into the wall just delivered to.
+    if _deposit_align_deg is None:
+        centre = 0
+    else:
+        centre = _wrap180(_deposit_align_deg + 180)
+        print("survey: last delivery squared to %d, so sweeping about %d"
+              % (_deposit_align_deg, centre))
 
     for angle in SCAN_ANGLES_DEG:
-        rotate_to_heading(0, heading0 + angle, SCAN_ROTATE_SPEED_DPS)
+        rotate_to_relative(base, centre + angle, SCAN_ROTATE_SPEED_DPS)
 
         # Diagnostic: requested vs actually-reached heading (relative to
-        # heading0), so a mismatch between the two is visible directly
+        # base), so a mismatch between the two is visible directly
         # rather than inferred from robot behaviour alone. actual should
         # match angle closely (within ROTATE_SLOWDOWN_MARGIN_DEG-ish); a
         # large or systematic gap here points at rotate_to_heading()
         # itself (or the gyro/motors), not at this loop or SCAN_ANGLES_DEG.
-        actual = hub.imu.heading() - heading0
-        print("survey: requested %d deg, actual %d deg" % (angle, actual))
+        actual = _wrap180(hub.imu.heading() - base)
+        print("survey: requested %d deg, actual %d deg"
+              % (_wrap180(centre + angle), actual))
 
         wait(SCAN_SETTLE_MS)  # let the camera grab a fresh frame at this heading
 
@@ -1227,13 +1274,13 @@ def state_V():
 
             if centre_on_ball():
                 print("survey: centred, heading %d deg relative to entry" %
-                      (hub.imu.heading() - heading0))
+                      _wrap180(hub.imu.heading() - base))
                 return "A"
 
             # Couldn't lock on -- ball lost mid-correction, or the bearing
             # never converged. Carry on scanning from the next angle
             # rather than handing A a target that isn't there; the scan's
-            # own targets are absolute (heading0 + angle), so whatever
+            # own targets are absolute (base + centre + angle), so whatever
             # rotation centring already did doesn't throw the rest off.
             print("survey: centring failed, resuming scan")
 
@@ -1621,21 +1668,6 @@ DEPOSIT_CORRECTION_MM = -80   # SIGNED, added to the camera's reported range
 DEPOSIT_ALIGN_ANGLES_DEG = (-135, -45, 45, 135)
 
 
-def _wrap180(deg):
-    """Fold an angle into -180..180.
-
-    Needed because hub.imu.heading() accumulates without wrapping -- after
-    enough turns around the zone it can read several hundred degrees, and
-    a raw subtraction against a fixed angle would then pick the wrong
-    alignment entirely, or unwind those whole turns to reach it.
-    """
-    while deg > 180:
-        deg -= 360
-    while deg < -180:
-        deg += 360
-    return deg
-
-
 def state_T():
     """DEPOSIT (design.md Sec7) -- NOT "green turn"; that's L/R above.
 
@@ -1701,6 +1733,11 @@ def state_T():
     print("deposit: at %d deg off entry, squaring to %d (turning %+d)"
           % (rel, best, turn))
     rotate_to_heading(0, hub.imu.heading() + turn, SCAN_ROTATE_SPEED_DPS)
+
+    # Remembered so the NEXT survey knows which way to look: the back
+    # bearing of this edge is where any remaining victims are.
+    global _deposit_align_deg
+    _deposit_align_deg = best
 
     # --- release ------------------------------------------------------
     #
@@ -1780,6 +1817,8 @@ _zone_heading0 = None      # heading the zone survey started from, recorded
                            # by state_V() and reused by state_D()
 _captured_kind = KIND_NONE  # which sphere kind state_A() drove at, so
                             # state_D() knows which point to deliver to
+_deposit_align_deg = None   # zone edge state_T() last squared up to, so the
+                            # next survey can sweep about its back bearing
 _captured_heading = None    # bearing off the zone entry heading the ball
                             # was captured at; its SIGN tells state_D()
                             # which side of the zone the robot is on
