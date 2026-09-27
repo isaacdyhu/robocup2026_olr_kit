@@ -1096,10 +1096,20 @@ CENTRE_MAX_STEPS = 12         # give up rather than shuffle forever if the
                               # ball it is never going to converge on.
 
 
-def centre_on_ball():
+def centre_on_target(kinds, kind_filter=KIND_NONE):
     """
-    Turn toward the ball in steps, STOPPING to measure between each, until
-    the camera reports it within CENTRE_TOLERANCE_DEG of dead ahead.
+    Turn toward a zone target in steps, STOPPING to measure between each,
+    until the camera reports it within CENTRE_TOLERANCE_DEG of dead ahead.
+
+    `kinds` is which KIND_* values count as the thing being centred on,
+    and `kind_filter` is passed to the camera so it can narrow its own
+    search -- see query_zone_camera() for why filtering there beats
+    filtering here.
+
+    Returns the final (kind, bearing, range_mm) reading once centred, or
+    None if the target was lost, the camera stopped answering, or the
+    step budget ran out. A reading is truthy and None is not, so callers
+    can treat this as a plain success test and still get the range.
 
     Stop-and-measure, not measure-while-turning, and that distinction is
     the whole point. SCAN_SETTLE_MS in this same file is 1500ms -- that is
@@ -1123,20 +1133,20 @@ def centre_on_ball():
         # Always measured stationary -- on the first pass the robot is
         # still settled from the scan's own pause, and on every later pass
         # from this loop's own settle after rotating.
-        result = query_zone_camera()
+        result = query_zone_camera(kind_filter)
         if result is None:
             print("centre: camera not responding")
-            return False
+            return None
 
         kind, bearing, dist = result
 
-        if kind not in SPHERE_KINDS:
-            print("centre: no ball visible at step %d (kind=%d)" % (step, kind))
-            return False
+        if kind not in kinds:
+            print("centre: no target visible at step %d (kind=%d)" % (step, kind))
+            return None
 
         if abs(bearing) <= CENTRE_TOLERANCE_DEG:
             print("centre: centred at bearing %d after %d step(s)" % (bearing, step))
-            return True
+            return result
 
         # Positive bearing = ball right of centre -> turn right
         # (clockwise), which is +1 in this file's convention throughout.
@@ -1149,7 +1159,12 @@ def centre_on_ball():
         wait(SCAN_SETTLE_MS)
 
     print("centre: gave up after %d steps" % CENTRE_MAX_STEPS)
-    return False
+    return None
+
+
+def centre_on_ball():
+    """Centre on a sphere -- the ball search's entry point, unchanged."""
+    return centre_on_target(SPHERE_KINDS)
 
 
 def state_V():
@@ -1436,11 +1451,11 @@ DELIVER_SCAN_ANGLES_DEG = [-135, -90, -45, 0, 45, 90, 135]
 
 # Sweeps before giving up: the first from wherever the capture left the
 # robot, then one more from the middle of the zone after repositioning.
-DELIVER_SWEEPS = 2
+DELIVER_SWEEPS = 3
 
 DELIVER_MIDDLE_TURN_DEG = 90    # face straight across the zone to cross it
 DELIVER_MIDDLE_DRIVE_MM = 300   # 30 cm toward the middle
-DELIVER_MIDDLE_SPEED_MM_S = 80
+DELIVER_MIDDLE_SPEED_MM_S = 300
 
 # Kinds 3 and 4 -- the evacuation points themselves, as opposed to the
 # spheres SPHERE_KINDS covers.
@@ -1587,11 +1602,121 @@ def state_D():
     return "V"  # design.md Sec7: D -> V when the triangle is missing
 
 
+# --- deposit (design.md Sec7 "DEPOSIT (state T)") ----------------------------
+
+DEPOSIT_SPEED_MM_S = 150       # mm/s for the drive up to the zone
+
+DEPOSIT_CORRECTION_MM = -80   # SIGNED, added to the camera's reported range
+                              # exactly as APPROACH_CORRECTION_MM is. More
+                              # negative than that one because the robot
+                              # must stop SHORT of the zone wall with the
+                              # ball overhanging it, not drive its own
+                              # wheels up to where the target was seen.
+                              # Untested placeholder.
+
+# The zone is a triangle in a corner, so its two straight edges run at
+# 45 degrees to the entry heading. Squaring up to one of them before
+# opening the claw is what puts the ball over the zone rather than over
+# the wall's lip, where it can roll back out.
+DEPOSIT_ALIGN_ANGLES_DEG = (-135, -45, 45, 135)
+
+
+def _wrap180(deg):
+    """Fold an angle into -180..180.
+
+    Needed because hub.imu.heading() accumulates without wrapping -- after
+    enough turns around the zone it can read several hundred degrees, and
+    a raw subtraction against a fixed angle would then pick the wrong
+    alignment entirely, or unwind those whole turns to reach it.
+    """
+    while deg > 180:
+        deg -= 360
+    while deg < -180:
+        deg += 360
+    return deg
+
+
 def state_T():
-    """DEPOSIT (design.md Sec7) -- NOT "green turn"; that's L/R above."""
-    # TODO -> V (released -- go find the next) / D (release failed,
-    #         still holding) / Q (hub 2 FAULT or timeout)
-    return None
+    """DEPOSIT (design.md Sec7) -- NOT "green turn"; that's L/R above.
+
+    Drive up to the evacuation point, square up to the nearest of the
+    zone's straight edges, and only then open the claw.
+    """
+    robot.stop()
+
+    base = _zone_heading0 if _zone_heading0 is not None else hub.imu.heading()
+
+    # The same point this victim belongs at that state_D() went looking for.
+    wanted = POINT_FOR_SPHERE.get(_captured_kind)
+    if wanted is None:
+        kind_filter = KIND_NONE
+        acceptable = POINT_KINDS
+    else:
+        kind_filter = wanted
+        acceptable = (wanted,)
+
+    # state_D() stopped at the scan angle it spotted the point from, with
+    # the point still off to one side of that. Centre properly before
+    # driving, or the drive-up runs at an angle and misses.
+    reading = centre_on_target(acceptable, kind_filter)
+    if reading is None:
+        print("deposit: lost the evacuation point while centring")
+        return "D"  # back to the sweep that found it in the first place
+
+    kind, bearing, dist = reading
+    travel = dist + DEPOSIT_CORRECTION_MM
+    print("deposit: point kind=%d at %d mm, driving %d mm (correction %d)"
+          % (kind, dist, travel, DEPOSIT_CORRECTION_MM))
+
+    if travel > 0:
+        robot.settings(straight_speed=DEPOSIT_SPEED_MM_S)
+        robot.straight(travel)
+        robot.stop()
+    else:
+        print("deposit: already within the correction distance, not driving")
+
+    # --- square up to the nearest zone edge ---------------------------
+    #
+    # Driving at the point leaves the robot pointing at wherever in the
+    # triangle the camera found it, which is not square to anything. The
+    # ball is released over the front of the robot, so an off-square
+    # release drops it over a corner or over the wall's lip. Turning to
+    # whichever edge angle is nearest costs at most 45 degrees.
+    rel = _wrap180(hub.imu.heading() - base)
+
+    # Explicit loop rather than min(key=...) -- the comparison is on the
+    # WRAPPED difference, not the raw one, and spelling that out avoids
+    # relying on keyword support in this MicroPython build.
+    best = DEPOSIT_ALIGN_ANGLES_DEG[0]
+    best_gap = abs(_wrap180(best - rel))
+    for candidate in DEPOSIT_ALIGN_ANGLES_DEG[1:]:
+        gap = abs(_wrap180(candidate - rel))
+        if gap < best_gap:
+            best, best_gap = candidate, gap
+
+    # Turn by the WRAPPED delta rather than to an absolute base + best:
+    # with an accumulated heading those can differ by whole revolutions,
+    # and the absolute form would spin the robot round to unwind them.
+    turn = _wrap180(best - rel)
+    print("deposit: at %d deg off entry, squaring to %d (turning %+d)"
+          % (rel, best, turn))
+    rotate_to_heading(0, hub.imu.heading() + turn, SCAN_ROTATE_SPEED_DPS)
+
+    # --- release ------------------------------------------------------
+    #
+    # Open only, with the lifter left at the carry height state_C() put
+    # it at -- design.md Sec10's note that the release position has to
+    # clear the 60mm wall is exactly why the ball is dropped in from
+    # above rather than lowered first.
+    if not hub2_goal(GOAL_OPEN):
+        print("deposit: claw would not open")
+        return "Q"  # design.md Sec7: T -> Q on hub 2 FAULT or timeout
+
+    print("deposit: released")
+    # TODO: design.md Sec7 also has T -> D when the release failed and the
+    # ball is still held. Telling that apart needs hub 2's grip verdict,
+    # which hub2_goal() still discards -- the same gap state_C() has.
+    return "V"  # released -- go find the next victim
 
 
 def state_K():
