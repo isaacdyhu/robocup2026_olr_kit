@@ -1053,6 +1053,18 @@ def ask(question, tries=CAMERA_POLL_TRIES, kind_filter=KIND_NONE):
 # dead or alive, either counts (design.md's own kind distinction is for
 # a later state to act on, not for V to filter here).
 SCAN_ANGLES_DEG = [-70, -60, -30, 0, 30, 60, 70]
+
+# Widening search, used only when the ordinary sweep above finds nothing.
+# A full circle rather than another arc: by this point the assumption
+# that the balls are somewhere ahead has already been proved wrong, so
+# there is no direction left worth privileging.
+SCAN_360_ANGLES_DEG = [0, 45, 90, 135, 180, 225, 270, 315]
+RECOVER_STEP_MM = 300           # how far to push into the zone between
+                                # full-circle scans
+RECOVER_SPEED_MM_S = 80
+RECOVER_MIDDLE_TURN_DEG = 90    # facing straight across the zone, so
+                                # driving forward crosses it rather than
+                                # burrowing further into a corner
 SCAN_ROTATE_SPEED_DPS = 100     # deg/s for each pivot step and the final
                                 # bearing-centring correction
 
@@ -1197,6 +1209,111 @@ def centre_on_ball():
     return centre_on_target(SPHERE_KINDS)
 
 
+def drive_on(distance_mm):
+    """Straight push, used by the widening search between scans."""
+    robot.settings(straight_speed=RECOVER_SPEED_MM_S)
+    robot.straight(distance_mm)
+    robot.stop()
+
+
+def scan_360():
+    """Full-circle sweep for a sphere, centring on the first one seen.
+
+    Returns True having centred, False having turned the whole way round
+    without finding one. Angles are stepped off wherever the robot
+    happens to be standing -- a full circle covers everything, so unlike
+    the ordinary sweep there is no reference heading worth measuring
+    against.
+    """
+    start = hub.imu.heading()
+
+    for angle in SCAN_360_ANGLES_DEG:
+        rotate_to_relative(start, angle, SCAN_ROTATE_SPEED_DPS)
+        wait(SCAN_SETTLE_MS)
+
+        result = query_zone_camera()
+        if result is None:
+            print("recover: camera not responding at %d deg" % angle)
+            continue
+
+        kind, bearing, dist = result
+        print("recover: %d deg -- kind=%d bearing=%d range=%d"
+              % (angle, kind, bearing, dist))
+
+        if kind in SPHERE_KINDS:
+            print("recover: sphere found at %d deg" % angle)
+            if centre_on_ball():
+                return True
+            print("recover: centring failed, carrying on round")
+
+    return False
+
+
+def recover_search():
+    """The ordinary sweep found nothing -- go looking properly.
+
+    Returns True if a ball was found and centred, False having exhausted
+    every move. Two starting situations, told apart by whether anything
+    has been delivered yet:
+
+      Nothing delivered -- this is the first survey of the visit and the
+      robot is still near the zone entrance, so one push inward and a
+      full look round is the whole search.
+
+      Something delivered -- the robot is tucked into the corner it just
+      deposited in, where most of the zone is behind it and the walls are
+      close enough to make a sweep from here nearly useless. It leaves
+      along the corner's back bearing, then works across the zone, taking
+      a full-circle scan after each push.
+    """
+    base = _zone_heading0 if _zone_heading0 is not None else hub.imu.heading()
+
+    if _deposit_align_deg is None:
+        # Square back up to the middle of the sweep before driving. The
+        # sweep finishes at its LAST angle (+70), so pushing straight
+        # ahead from there sends the robot off at 70 degrees to the
+        # direction it was actually meant to explore. The two branches
+        # below already turn to an explicit heading before driving; this
+        # one needs the same treatment, its heading just happens to be
+        # the entry bearing itself.
+        print("recover: nothing found from the entrance, squaring up and "
+              "pushing %d mm in" % RECOVER_STEP_MM)
+        rotate_to_relative(base, 0, SCAN_ROTATE_SPEED_DPS)
+        drive_on(RECOVER_STEP_MM)
+        return scan_360()
+
+    # Out of the corner first, along the same back bearing the survey
+    # would have swept about.
+    back = _wrap180(_deposit_align_deg + 180)
+    print("recover: leaving the %d corner along %d, %d mm"
+          % (_deposit_align_deg, back, RECOVER_STEP_MM))
+    rotate_to_relative(base, back, SCAN_ROTATE_SPEED_DPS)
+    drive_on(RECOVER_STEP_MM)
+    if scan_360():
+        return True
+
+    # Then across. Which way the middle is follows from which corner was
+    # delivered to: the two negative edge angles are the left half of the
+    # zone, the two positive ones the right half, so a robot on the left
+    # crosses to +90 and one on the right to -90.
+    on_left = _deposit_align_deg < 0
+    across = RECOVER_MIDDLE_TURN_DEG if on_left else -RECOVER_MIDDLE_TURN_DEG
+    print("recover: on the %s half, crossing toward the middle (%d)"
+          % ("left" if on_left else "right", across))
+    rotate_to_relative(base, across, SCAN_ROTATE_SPEED_DPS)
+    drive_on(RECOVER_STEP_MM)
+    if scan_360():
+        return True
+
+    # One last push, same direction across -- re-aimed rather than just
+    # driving on, because scan_360() left the robot facing wherever its
+    # final step put it.
+    print("recover: last push across, %d mm" % RECOVER_STEP_MM)
+    rotate_to_relative(base, across, SCAN_ROTATE_SPEED_DPS)
+    drive_on(RECOVER_STEP_MM)
+    return scan_360()
+
+
 def state_V():
     """SURVEY (design.md Sec7) -- staggered rotation scan for a sphere,
     then centre on its reported bearing before handing off to A."""
@@ -1285,9 +1402,16 @@ def state_V():
             print("survey: centring failed, resuming scan")
 
     print("survey: no sphere found after full scan")
-    # TODO -> K (none left, or time short) / Q (scan failed) per
-    # design.md Sec7 -- neither implemented yet, so this just stays in V.
-    return None
+
+    if recover_search():
+        print("survey: recovered, heading %d deg relative to entry"
+              % _wrap180(hub.imu.heading() - base))
+        return "A"
+
+    # Every scan from every position has come up empty, so there is no
+    # ball left to find and nothing further this state can try.
+    print("survey: no ball found anywhere, giving up")
+    return "H"
 
 
 # --- approach (design.md Sec7 "APPROACH (state A)") --------------------------
@@ -1839,7 +1963,7 @@ def sync_camera_line_mode():
 # instant it's entered, and transitions chain straight into each other
 # with no button presses at all. Flip this and reflash; it isn't wired
 # to a live button, so it can't be changed without stopping the program.
-DEBUG_MODE = True
+DEBUG_MODE = False
 
 state = "F"  # starts directly in F rather than S, since S's real
              # start-button wait isn't implemented yet either
@@ -1871,6 +1995,12 @@ _zone_mode_active = False  # state_B()'s one-shot entry guard -- True
 # entry. When DEBUG_MODE is False this is forced True every tick below,
 # so it never gates anything.
 armed = False
+
+# Build marker. If this line is missing from the console at start-up, the
+# hub is running a DIFFERENT copy of this file than the one on disk --
+# which is worth knowing before debugging behaviour that the source says
+# is impossible.
+print("line_follow: build 2026-09-27 16:43 -- recovery ladder + 3-ball egress")
 
 # F is the very first state, with no transition into it for the
 # ZONE_STATES check below to hook -- synced explicitly here instead,
