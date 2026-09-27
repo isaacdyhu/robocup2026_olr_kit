@@ -1661,6 +1661,17 @@ DEPOSIT_CORRECTION_MM = -80   # SIGNED, added to the camera's reported range
                               # wheels up to where the target was seen.
                               # Untested placeholder.
 
+DEPOSIT_BACKOFF_MM = 50      # reversed after releasing, BEFORE anything
+                              # rotates. The drive-up deliberately parks
+                              # the robot overhanging the zone wall, which
+                              # is exactly the wrong place to start
+                              # spinning: a survey pivot from there sweeps
+                              # the chassis straight into it. Untested
+                              # placeholder.
+
+DELIVERIES_TO_EGRESS = 3      # victims to deliver before giving up on the
+                              # zone and heading for the exit
+
 # The zone is a triangle in a corner, so its two straight edges run at
 # 45 degrees to the entry heading. Squaring up to one of them before
 # opening the claw is what puts the ball over the zone rather than over
@@ -1749,10 +1760,30 @@ def state_T():
         print("deposit: claw would not open")
         return "Q"  # design.md Sec7: T -> Q on hub 2 FAULT or timeout
 
-    print("deposit: released")
+    # Back off BEFORE returning, not at the start of the next state: the
+    # robot is parked overhanging the zone wall, and whatever comes next
+    # begins by rotating. Reversing here means every exit from this state
+    # leaves the robot somewhere it can safely turn.
+    print("deposit: released, reversing %d mm clear of the zone"
+          % DEPOSIT_BACKOFF_MM)
+    robot.settings(straight_speed=DEPOSIT_SPEED_MM_S)
+    robot.straight(-DEPOSIT_BACKOFF_MM)
+    robot.stop()
+
+    global _delivered_count
+    _delivered_count += 1
+    print("deposit: %d of %d delivered" % (_delivered_count, DELIVERIES_TO_EGRESS))
+
     # TODO: design.md Sec7 also has T -> D when the release failed and the
     # ball is still held. Telling that apart needs hub 2's grip verdict,
-    # which hub2_goal() still discards -- the same gap state_C() has.
+    # which hub2_goal() still discards -- the same gap state_C() has. Note
+    # that gap feeds the count above too: a release that silently failed
+    # still counts as a delivery here.
+    if _delivered_count >= DELIVERIES_TO_EGRESS:
+        print("deposit: all %d delivered, heading for the exit"
+              % DELIVERIES_TO_EGRESS)
+        return "K"
+
     return "V"  # released -- go find the next victim
 
 
@@ -1817,6 +1848,8 @@ _zone_heading0 = None      # heading the zone survey started from, recorded
                            # by state_V() and reused by state_D()
 _captured_kind = KIND_NONE  # which sphere kind state_A() drove at, so
                             # state_D() knows which point to deliver to
+_delivered_count = 0        # victims released so far; at
+                            # DELIVERIES_TO_EGRESS the zone work is done
 _deposit_align_deg = None   # zone edge state_T() last squared up to, so the
                             # next survey can sweep about its back bearing
 _captured_heading = None    # bearing off the zone entry heading the ball
