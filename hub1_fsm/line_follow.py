@@ -414,19 +414,29 @@ def hunt_for_branch(pivot_offset_mm, turn_sign, far_sensor):
 # to a full 180-degree loop, where wheel slip would accumulate into a
 # real heading error. rotate_to_heading() runs continuously and stops
 # only once the gyro itself confirms the target heading.
-OBSTACLE_TRIGGER_MM = 220         # design.md's exact figure -- ultrasonic
+OBSTACLE_TRIGGER_MM = 250         # design.md's exact figure -- ultrasonic
                                   # threshold for the F -> O guard
-OBSTACLE_SPIN_DEG = 70           # move 1: degrees to turn tangential to
+OBSTACLE_SPIN_DEG = 80           # move 1: degrees to turn tangential to
                                   # the tower
-OBSTACLE_LOOP_DEG = 120          # move 2: half-circle around the tower
-OBSTACLE_PIVOT_RADIUS_MM = 200   # move 2's pivot distance -- a fixed
+OBSTACLE_LOOP_DEG = 130          # move 2: sweep back around the tower.
+                                 # MUST stay well under 2 x OBSTACLE_SPIN_DEG.
+                                 # At exactly twice it the arc lands the robot
+                                 # back ON the line, and past that it ends up
+                                 # on the far side heading away, where move 3
+                                 # drives further off instead of rejoining.
+                                 # The gyro closes the loop on heading but
+                                 # nothing closes it on POSITION, so over an
+                                 # arc this long slip alone can eat a small
+                                 # margin: 130 against a spin of 80 leaves
+                                 # ~140mm of lateral room, 150 left only ~50.
+OBSTACLE_PIVOT_RADIUS_MM = 300   # move 2's pivot distance -- a fixed
                                   # assumed clearance rather than the
                                   # ultrasonic's live reading at trigger
                                   # time, so the loop's radius doesn't
                                   # depend on exactly where inside
                                   # OBSTACLE_TRIGGER_MM the guard happened
                                   # to fire.
-OBSTACLE_ROTATE_SPEED_DPS = 150  # deg/s for moves 1-2
+OBSTACLE_ROTATE_SPEED_DPS = 200  # deg/s for moves 1-2
 OBSTACLE_ROTATE_POLL_MS = 10     # gyro poll interval while rotating
 
 ROTATE_SLOWDOWN_MARGIN_DEG = 15  # once rotate_to_heading() is this close
@@ -442,11 +452,14 @@ ROTATE_SLOWDOWN_MARGIN_DEG = 15  # once rotate_to_heading() is this close
                                   # placeholder.
 ROTATE_CREEP_SPEED_DPS = 30      # deg/s during that final approach
 
-OBSTACLE_REJOIN_MAX_MM = 300     # move 3: give up and -> H if the line
+OBSTACLE_REJOIN_MAX_MM = 400     # move 3: give up and -> H if the line
                                   # still hasn't been found after this
                                   # much straight-line travel
 OBSTACLE_REJOIN_SPEED_MM_S = 60  # mm/s, straight-line speed for move 3
-OBSTACLE_REJOIN_POLL_MS = 5     # sensor-check interval while driving straight
+OBSTACLE_REJOIN_POLL_MS = 10    # sensor-check interval while driving straight.
+                                 # Two hsv() reads per pass now, so 5ms was
+                                 # tighter than the sensors can answer; 10ms
+                                 # is still 0.6mm of travel at rejoin speed.
 # All untested placeholders, same as every other numeric constant here.
 
 
@@ -462,15 +475,38 @@ def drive_until_black(sensor, max_distance_mm, speed_mm_s):
     states (and rotate_to_heading()'s own gyro baseline) store absolute
     readings a reset would silently invalidate.
     """
+    other = left_sensor if sensor is right_sensor else right_sensor
+    darkest = 100          # on the watched sensor
+    darkest_other = 100    # on the one that is not being gated on
+
     start_mm = robot.distance()
     robot.drive(speed_mm_s, 0)
     while True:
-        if is_black(sensor.hsv()):
+        reading = sensor.hsv()
+        if reading.v < darkest:
+            darkest = reading.v
+        other_v = other.hsv().v
+        if other_v < darkest_other:
+            darkest_other = other_v
+
+        if is_black(reading):
             robot.stop()
+            print("rejoin: black at v=%d after %d mm"
+                  % (reading.v, robot.distance() - start_mm))
             return True
+
         if robot.distance() - start_mm >= max_distance_mm:
             robot.stop()
+            # The darkest readings are the whole diagnosis. If either got
+            # near the line's real value but stayed above BLACK_VAL_MAX,
+            # the threshold is too strict rather than the geometry being
+            # wrong -- the sensor passed over the line and was not
+            # allowed to say so.
+            print("rejoin: no black in %d mm -- darkest v=%d on the watched "
+                  "sensor, v=%d on the other (threshold is %d)"
+                  % (max_distance_mm, darkest, darkest_other, BLACK_VAL_MAX))
             return False
+
         wait(OBSTACLE_REJOIN_POLL_MS)
 
 
@@ -789,14 +825,49 @@ ZONE_BACKUP_SPEED_MM_S = 60    # mm/s for the backup move -- applied via
 
 
 def state_B():
-    """Zone check (design.md Sec6) -- simplified: recognise that the line
-    is genuinely gone (guard 4 already confirmed both-white for
-    LINE_LOST_MM), back up a fixed distance, flag zone mode active, then
-    hand off to V. Design.md's fuller spec -- raise the camera, spin 360
-    scanning for zone targets, dispatch to F/A/V/H depending on what's
-    found -- is not implemented; this always assumes case d (zone
-    confirmed, survey next) and goes straight to V."""
+    """Zone check (design.md Sec6) -- confirm with the camera that the
+    line really is gone before committing to the zone, then back up and
+    hand off to V.
+
+    Guard 4's evidence is NOT sufficient on its own. Both inner sensors
+    reading white is also exactly what good line-following looks like:
+    the line sits BETWEEN them while tracking, so a straight stretch
+    longer than LINE_LOST_MM produces the identical reading to an empty
+    white floor. The inner pair physically cannot separate those two,
+    and neither can hue -- white comes back s=0, where the hue figure is
+    pure noise and can read anything at all.
+
+    The camera can, because it sees further than the wheelbase. 'A' asks
+    whether there is a black line ANYWHERE ahead: a long straight has
+    one, the zone does not.
+    """
     global _zone_mode_active
+
+    robot.stop()
+
+    reply = ask(QUESTION_AHEAD, CAMERA_AIM_POLL_TRIES)
+
+    if reply is None:
+        # design.md Sec6 sends an unusable camera to H. Kept on the line
+        # instead: ask() has already spent its full retry budget by now,
+        # but ending the run over a transient link fault is worse than
+        # following the line for another LINE_LOST_MM and asking again.
+        print("zone check: camera would not answer, staying on the line")
+        sync_camera_line_mode()
+        return "F"
+
+    _echo, line_ahead, angle, coverage = reply
+    if line_ahead:
+        # False alarm -- a long straight, not the zone. The 'A' question
+        # raised the aim to ask it, so put the camera back down before
+        # handing control to F.
+        print("zone check: line still ahead (angle=%d, %d%% black) -- "
+              "not the zone, resuming" % (angle, coverage))
+        sync_camera_line_mode()
+        return "F"
+
+    print("zone check: nothing ahead (%d%% black) -- committing to the zone"
+          % coverage)
 
     # Cancel state_F()'s continuous drive() before the blocking
     # straight() move below -- same reasoning as every other state that
@@ -804,7 +875,6 @@ def state_B():
     # here (unlike state_O()'s multi-tick equivalents once did) -- B now
     # always finishes by transitioning straight to V in the same call,
     # so it's never invoked again afterward to repeat the backup.
-    robot.stop()
     robot.settings(straight_speed=ZONE_BACKUP_SPEED_MM_S)
     robot.straight(-ZONE_BACKUP_MM)  # negative = backward
 
