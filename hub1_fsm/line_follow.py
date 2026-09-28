@@ -304,12 +304,12 @@ HUNT_SPEED_DPS = 50       # slower than PIVOT_SPEED_DPS -- this phase is
                           # more precisely on the line. Untested placeholder.
 HUNT_POLL_MS = 10         # sensor-check interval while hunting
 
-BLACK_VAL_MAX = 20  # hsv().v at/below this reads as "on the black line".
+BLACK_VAL_MAX = 10  # hsv().v at/below this reads as "on the black line".
                     # Untested placeholder -- same normalise()-free
                     # shortcut follow_line() uses, no calibrated
                     # white/black window yet (design.md Sec6.1.2).
 
-WHITE_VAL_MIN = 70  # hsv().v at/above this reads as "on white/background".
+WHITE_VAL_MIN = 85  # hsv().v at/above this reads as "on white/background".
                     # A genuine positive test for white, not just "not
                     # black" -- a grey in-between reading counts as
                     # neither, same untested-placeholder caveat as
