@@ -304,7 +304,7 @@ HUNT_SPEED_DPS = 50       # slower than PIVOT_SPEED_DPS -- this phase is
                           # more precisely on the line. Untested placeholder.
 HUNT_POLL_MS = 10         # sensor-check interval while hunting
 
-BLACK_VAL_MAX = 10  # hsv().v at/below this reads as "on the black line".
+BLACK_VAL_MAX = 50  # hsv().v at/below this reads as "on the black line".
                     # Untested placeholder -- same normalise()-free
                     # shortcut follow_line() uses, no calibrated
                     # white/black window yet (design.md Sec6.1.2).
@@ -1992,9 +1992,29 @@ EGRESS_WALL_STANDOFF_MM = 200  # close on the wall until this near
 EGRESS_GAP_MM = 300            # ultrasonic reading above this means no wall
                                # ahead -- i.e. the exit
 EGRESS_SIDESTEP_MM = 100       # sideways shuffle between wall readings
-EGRESS_EXIT_DRIVE_MM = 500     # how far to drive out through the gap
 EGRESS_SPEED_MM_S = 80
 EGRESS_POLL_MS = 20
+
+# Where to look for the line once through the gap, as offsets from
+# whatever heading the robot came out on. Nearest-first, so a line
+# straight ahead is taken without turning at all and the robot only
+# swings wide when it has to.
+
+EGRESS_GAP_CONFIRM = 3         # consecutive long readings before the gap
+                               # is believed. One sample is easy to fool --
+                               # the beam clipping the gap's edge, or
+                               # glancing off the wall at an angle, both
+                               # read as open space for an instant.
+EGRESS_GAP_CONFIRM_MS = 50     # between those readings
+
+EGRESS_ZIGZAG_ANGLE_DEG = 45   # each leg this far off the bearing the
+                               # robot came out on, alternating sides
+EGRESS_ZIGZAG_LEG_MM = 150     # length of one leg. At 45 degrees a leg
+                               # advances 106mm and sweeps 106mm across,
+                               # so the pair of them covers a swath wider
+                               # than the sensor spacing on every cycle.
+EGRESS_ZIGZAG_MAX_LEGS = 8     # ~850mm of forward progress before giving
+                               # up, well past where the line should be
 
 EGRESS_APPROACH_MAX_MM = 1500  # give up closing on a wall that never
                                # arrives, rather than crossing the field
@@ -2044,6 +2064,23 @@ def any_sensor_black():
     return state[3] <= BLACK_VAL_MAX or state[4] <= BLACK_VAL_MAX
 
 
+def gap_is_real():
+    """True only if the way ahead stays clear over several readings.
+
+    The zigzag that follows commits the robot to driving away from the
+    wall, so it must not start on a single hopeful sample. Every reading
+    has to clear EGRESS_GAP_MM; one short one anywhere in the run means
+    there is still wall there.
+    """
+    for _ in range(EGRESS_GAP_CONFIRM):
+        reading = ultrasonic_sensor.distance()
+        if reading <= EGRESS_GAP_MM:
+            print("egress: gap not confirmed, wall back at %d mm" % reading)
+            return False
+        wait(EGRESS_GAP_CONFIRM_MS)
+    return True
+
+
 def state_K():
     """EGRESS (design.md Sec7) -- leave the zone by the edge it was
     entered from, feeling along the wall for the gap."""
@@ -2085,7 +2122,9 @@ def state_K():
     for step in range(EGRESS_MAX_SIDESTEPS):
         reading = ultrasonic_sensor.distance()
         print("egress: step %d, wall at %d mm" % (step, reading))
-        if reading > EGRESS_GAP_MM:
+        if reading > EGRESS_GAP_MM and gap_is_real():
+            print("egress: gap confirmed clear over %d readings"
+                  % EGRESS_GAP_CONFIRM)
             found = True
             break
 
@@ -2104,20 +2143,44 @@ def state_K():
     # meet the line again, and the first black any of them sees is it.
     # Stopping ON that black rather than driving the full distance is
     # what leaves state F something to pick up.
-    print("egress: gap found, driving out up to %d mm" % EGRESS_EXIT_DRIVE_MM)
-    start = robot.distance()
-    robot.drive(EGRESS_SPEED_MM_S, 0)
-    while robot.distance() - start < EGRESS_EXIT_DRIVE_MM:
-        if any_sensor_black():
-            robot.stop()
-            print("egress: black seen after %d mm -- line reacquired"
-                  % (robot.distance() - start))
-            return "F"
-        wait(EGRESS_POLL_MS)
-    robot.stop()
+    # --- zigzag out, hunting for the line -----------------------------
+    #
+    # Driving straight out only finds the line if it happens to lie
+    # across the robot's path. Weaving at 45 degrees sweeps a swath
+    # instead, so a line running at almost any angle gets crossed.
+    print("egress: gap found, zigzagging out in %d mm legs"
+          % EGRESS_ZIGZAG_LEG_MM)
 
-    print("egress: drove the full %d mm without seeing black"
-          % EGRESS_EXIT_DRIVE_MM)
+    exit_heading = hub.imu.heading()  # the bearing the robot came out on;
+                                      # legs alternate either side of it
+    direction = -1                    # first leg to the left
+
+    for leg in range(EGRESS_ZIGZAG_MAX_LEGS):
+        rotate_to_relative(exit_heading, direction * EGRESS_ZIGZAG_ANGLE_DEG,
+                           SCAN_ROTATE_SPEED_DPS)
+
+        # Gate on the SECOND sensor to reach the line, not the first.
+        # Travelling left, the left sensor crosses first and the right
+        # follows, so stopping on the right leaves the line BETWEEN the
+        # pair -- which is what state F needs to pick it up. Stopping on
+        # the first would leave the line outside them, off to one side,
+        # and F would open with the error pointing the wrong way.
+        if direction < 0:
+            watched, going, watching = right_sensor, "left", "right"
+        else:
+            watched, going, watching = left_sensor, "right", "left"
+
+        print("egress: leg %d heading %s, watching the %s sensor"
+              % (leg + 1, going, watching))
+
+        if drive_until_black(watched, EGRESS_ZIGZAG_LEG_MM,
+                             EGRESS_SPEED_MM_S):
+            print("egress: line reacquired on leg %d" % (leg + 1))
+            return "F"
+
+        direction = -direction
+
+    print("egress: no line after %d zigzag legs" % EGRESS_ZIGZAG_MAX_LEGS)
     return "F"  # out of the zone either way; F will hunt for the line
 
 
