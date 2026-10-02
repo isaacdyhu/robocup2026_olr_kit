@@ -158,7 +158,7 @@ def is_green(hsv):
     )
 
 
-def follow_line(l_hsv, r_hsv):
+def follow_line(l_hsv, r_hsv, v_max=V_MAX, v_min=V_MIN):
     """
     State F's actual driving behaviour: continuous curvature-based
     steering (design.md Sec4). Speed scheduling (fast when centred, slow
@@ -172,7 +172,9 @@ def follow_line(l_hsv, r_hsv):
     """
     error = l_hsv.v - r_hsv.v  # no polarity term -- state W (inverted
                                # sign) isn't implemented yet either
-    speed = V_MAX - (V_MAX - V_MIN) * min(1, abs(error) / ERROR_FULL)
+    # v_max/v_min default to the flat-ground pair, so every existing
+    # caller is unchanged; state_U() passes a faster set for climbing.
+    speed = v_max - (v_max - v_min) * min(1, abs(error) / ERROR_FULL)
     turn_rate = STEER_GAIN * error * speed
     turn_rate = max(-TURN_MAX, min(TURN_MAX, turn_rate))
     robot.drive(speed, turn_rate)
@@ -414,9 +416,9 @@ def hunt_for_branch(pivot_offset_mm, turn_sign, far_sensor):
 # to a full 180-degree loop, where wheel slip would accumulate into a
 # real heading error. rotate_to_heading() runs continuously and stops
 # only once the gyro itself confirms the target heading.
-OBSTACLE_TRIGGER_MM = 250         # design.md's exact figure -- ultrasonic
+OBSTACLE_TRIGGER_MM = 220         # design.md's exact figure -- ultrasonic
                                   # threshold for the F -> O guard
-OBSTACLE_SPIN_DEG = 75           # move 1: degrees to turn tangential to
+OBSTACLE_SPIN_DEG = 70           # move 1: degrees to turn tangential to
                                   # the tower
 OBSTACLE_LOOP_DEG = 130          # move 2: sweep back around the tower.
                                  # MUST stay well under 2 x OBSTACLE_SPIN_DEG.
@@ -429,7 +431,7 @@ OBSTACLE_LOOP_DEG = 130          # move 2: sweep back around the tower.
                                  # arc this long slip alone can eat a small
                                  # margin: 130 against a spin of 80 leaves
                                  # ~140mm of lateral room, 150 left only ~50.
-OBSTACLE_PIVOT_RADIUS_MM = 250   # move 2's pivot distance -- a fixed
+OBSTACLE_PIVOT_RADIUS_MM = 220   # move 2's pivot distance -- a fixed
                                   # assumed clearance rather than the
                                   # ultrasonic's live reading at trigger
                                   # time, so the loop's radius doesn't
@@ -638,13 +640,24 @@ def state_F():
         _green_streak = 0
         return "L" if left_green else "R"
 
+    # Guard 1b: steep incline -> U. Ahead of the obstacle guard on
+    # purpose -- a ramp rising into the ultrasonic beam reads as
+    # something 150mm ahead, so whichever of these is tested first
+    # decides whether a seesaw is climbed or driven around.
+    roll = hub_roll_deg()
+    if abs(roll) > UPHILL_ENTER_ROLL_DEG:
+        print("incline: roll %d exceeds %d -- climbing"
+              % (roll, UPHILL_ENTER_ROLL_DEG))
+        return "U"
+
     # Guard 2: obstacle -> O (design.md Sec4 "Guard ordering within the
     # loop"). state_O() re-reads the ultrasonic itself on entry rather
     # than trusting this exact reading, so nothing needs to be stashed
     # here beyond the transition itself.
-    if ultrasonic_sensor.distance() < OBSTACLE_TRIGGER_MM:
-        print("obstacle: detected within %d mm" % OBSTACLE_TRIGGER_MM)
-        return "O"
+    if obstacle_bypass_available():
+        if ultrasonic_sensor.distance() < OBSTACLE_TRIGGER_MM:
+            print("obstacle: detected within %d mm" % OBSTACLE_TRIGGER_MM)
+            return "O"
 
     # Guard 3: both inner sensors dark -> X (design.md Sec4 "Guard
     # ordering within the loop"). Reuses is_black()/BLACK_VAL_MAX --
@@ -674,6 +687,114 @@ def state_F():
         _line_lost_start_mm = None
 
     return None
+
+
+# --- uphill / seesaw (state U) -----------------------------------------------
+#
+# Not a design.md state. The seesaw is the one place on the course where
+# the robot can tip over on its own: it climbs nose-up, crosses the
+# pivot, and the far side drops away under it. Carrying the claw low
+# through that puts the mass where it cannot flip the robot forward.
+UPHILL_ENTER_ROLL_DEG = 17   # |roll| above this means a real incline, not
+                             # the chassis rocking over a tile seam
+UPHILL_LEVEL_ROLL_DEG = 8    # |roll| at or under this counts as level again
+
+# The seesaw passes through level TWICE: once crossing the pivot, and
+# again at the bottom. Exiting on the first would raise the claw at the
+# exact moment of the tip, which is what the claw is down for -- so level
+# has to HOLD before it counts. The pivot crossing is momentary; the
+# bottom is not.
+UPHILL_LEVEL_CONFIRM_MS = 1000
+
+UPHILL_V_MAX = 100           # climbing needs more than the flat-ground 60:
+UPHILL_V_MIN = 40            # a ramp robs speed and stalling mid-climb is
+                             # worse than overshooting the crest
+UPHILL_MAX_MS = 20000        # backstop, in case the robot never levels out
+UPHILL_POLL_MS = 10
+
+
+def hub_roll_deg():
+    """Roll angle from the hub's IMU, in degrees.
+
+    hub.imu.tilt() gives (pitch, roll) in that order. Which of the two
+    actually tracks a ramp depends on how the hub is bolted to the
+    chassis -- this takes roll because that is the one that moves on
+    THIS robot. If a rebuild turns the hub a quarter turn, this is the
+    one line to change.
+    """
+    _pitch, roll = hub.imu.tilt()
+    return roll
+
+
+def hold_wheels():
+    """Lock both wheels at their current angle.
+
+    stop() lets them coast and brake() only resists, and neither is
+    enough on a slope: the claw moving shifts the robot's balance, and
+    a coasting drive base rolls back down the ramp while it happens.
+    hold() actively fights that.
+    """
+    robot.stop()          # end the DriveBase command before taking the
+                          # motors directly, as everywhere else in this file
+    left_motor.hold()
+    right_motor.hold()
+
+
+def state_U():
+    """UPHILL (state U) -- cross the seesaw with the claw down.
+
+    Entered from F only, on roll exceeding UPHILL_ENTER_ROLL_DEG, and
+    always returns to F.
+
+    The ultrasonic is deliberately not consulted anywhere in here. On a
+    ramp it reads the slope rising into the beam, which looks exactly
+    like an obstacle 150mm ahead, and F's guard 2 would send the robot
+    into an avoidance manoeuvre halfway up a seesaw. Simply not asking
+    is the whole of "ignore the distance sensor" -- this state runs its
+    own loop and never evaluates that guard.
+    """
+    print("uphill: roll %d, claw down for the climb" % hub_roll_deg())
+
+    # Wheels locked while the claw moves, both here and on the way out.
+    # The lifter swinging changes where the weight sits, and on a slope a
+    # drive base that is merely stopped will roll with it.
+    hold_wheels()
+    if not hub2_goal(GOAL_LOWER):
+        print("uphill: WARNING claw would not lower, climbing anyway")
+
+    timer = StopWatch()
+    level_since = None
+
+    while True:
+        l_hsv, r_hsv = read_sensors()
+        follow_line(l_hsv, r_hsv, UPHILL_V_MAX, UPHILL_V_MIN)
+
+        roll = hub_roll_deg()
+        if abs(roll) <= UPHILL_LEVEL_ROLL_DEG:
+            if level_since is None:
+                level_since = timer.time()
+            elif timer.time() - level_since >= UPHILL_LEVEL_CONFIRM_MS:
+                print("uphill: level for %d ms at roll %d -- done"
+                      % (UPHILL_LEVEL_CONFIRM_MS, roll))
+                break
+        else:
+            level_since = None   # still on the slope, or over the pivot
+
+        if timer.time() >= UPHILL_MAX_MS:
+            print("uphill: %d ms without levelling out, giving up on the climb"
+                  % UPHILL_MAX_MS)
+            break
+
+        wait(UPHILL_POLL_MS)
+
+    # Claw back up before handing control back, wheels locked again for
+    # the same reason as on the way in.
+    hold_wheels()
+    if not hub2_goal(GOAL_RAISE):
+        print("uphill: WARNING claw would not raise, continuing anyway")
+
+    print("uphill: back to line following")
+    return "F"
 
 
 def state_W():
@@ -772,10 +893,38 @@ def state_R():
     return "F"
 
 
+def obstacle_bypass_available():
+    """True while this run's single obstacle bypass is still unused.
+
+    The bypass is a large blind manoeuvre -- an 80 degree spin, a 130
+    degree arc on a 300mm radius, then a hunt for the line -- and it is
+    only safe to fire at a real obstacle. Anything else that puts a
+    reading under OBSTACLE_TRIGGER_MM in front of the ultrasonic would
+    send the robot on that same loop: a wall, a ramp rising into the
+    beam, another robot, or the far side of the seesaw just after state
+    U hands back. A course carries one obstacle, so after the first
+    bypass every later trigger is more likely to be one of those than a
+    second obstacle, and driving a metre-long arc off the line on a
+    false reading costs far more than missing a second obstacle would.
+
+    Never reset: "once per run" means the life of the program. If state
+    H ever grows design.md's full reset (polarity, camera aim, lockouts,
+    counters), this is one of the things it would have to decide about.
+    """
+    return not _obstacle_used
+
+
 def state_O():
     """Obstacle bypass -- circle the water tower using it as the pivot,
     gyro-gated (see this file's "obstacle bypass" section header for the
     full derivation of why each step is signed the way it is)."""
+    global _obstacle_used
+
+    # Spent on ENTRY, not on success. A bypass that goes wrong has still
+    # driven the robot a long way off the line, and letting it retry
+    # from there would compound that rather than recover from it.
+    _obstacle_used = True
+
     # Cancel state_F()'s continuous drive() before taking direct motor
     # control inside rotate_to_heading() -- same reasoning as
     # state_L()/state_R().
@@ -2286,6 +2435,7 @@ STATE_FUNCTIONS = {
     "L": state_L, "R": state_R, "O": state_O, "B": state_B, "H": state_H,
     "V": state_V, "A": state_A, "C": state_C, "D": state_D, "T": state_T,
     "K": state_K, "Q": state_Q,
+    "U": state_U,   # not a design.md state -- the seesaw, see state_U()
 }
 
 # design.md Sec7's zone states -- everything else (line-following and its
@@ -2329,6 +2479,9 @@ _zone_heading0 = None      # heading the zone survey started from, recorded
                            # by state_V() and reused by state_D()
 _captured_kind = KIND_NONE  # which sphere kind state_A() drove at, so
                             # state_D() knows which point to deliver to
+_obstacle_used = False      # the one obstacle bypass per run, spent on
+                            # entry to state_O -- see
+                            # obstacle_bypass_available()
 _delivered_count = 0        # victims released so far; at
                             # DELIVERIES_TO_EGRESS the zone work is done
 _deposit_align_deg = None   # zone edge state_T() last squared up to, so the
