@@ -1858,6 +1858,18 @@ DEPOSIT_CORRECTION_MM = 0    # SIGNED, added to the camera's reported range
                               # on the lip and rolling back out.
                               # Untested placeholder.
 
+DEPOSIT_STALL_CONFIRM_MS = 200 # the drive-up is allowed to END on a stall:
+                               # the robot is deliberately driven at the
+                               # zone edge, so hitting it is success, not
+                               # failure. Debounced, because stalled() can
+                               # flicker true while the motors are still
+                               # winding up to speed, and acting on that
+                               # would cut the approach short before the
+                               # robot had gone anywhere.
+DEPOSIT_DRIVE_TIMEOUT_MS = 8000 # backstop: carry on regardless if the move
+                               # neither finishes nor stalls
+DEPOSIT_DRIVE_POLL_MS = 20
+
 DEPOSIT_BACKOFF_MM = 100      # reversed after releasing, BEFORE anything
                               # rotates. The drive-up deliberately parks
                               # the robot overhanging the zone wall, which
@@ -1909,8 +1921,40 @@ def state_T():
           % (kind, dist, travel, DEPOSIT_CORRECTION_MM))
 
     if travel > 0:
+        # Non-blocking, because a blocking straight() cannot finish once
+        # the robot is up against the zone edge: the wheels stop turning
+        # short of the distance target, the move never completes, and
+        # state T hangs there still holding the ball. Driving into that
+        # edge is the INTENT -- DEPOSIT_CORRECTION_MM deliberately
+        # overshoots the measured range so the ball clears the lip -- so
+        # a stall means the approach worked, and the release should
+        # carry on from wherever it stopped.
+        start = robot.distance()
         robot.settings(straight_speed=DEPOSIT_SPEED_MM_S)
-        robot.straight(travel)
+        robot.straight(travel, wait=False)
+
+        timer = StopWatch()
+        stalled_since = None
+
+        while not robot.done():
+            if robot.stalled():
+                if stalled_since is None:
+                    stalled_since = timer.time()
+                elif timer.time() - stalled_since >= DEPOSIT_STALL_CONFIRM_MS:
+                    print("deposit: up against the edge after %d mm of %d "
+                          "-- releasing from here"
+                          % (robot.distance() - start, travel))
+                    break
+            else:
+                stalled_since = None   # only a SUSTAINED stall counts
+
+            if timer.time() >= DEPOSIT_DRIVE_TIMEOUT_MS:
+                print("deposit: drive-up neither finished nor stalled in "
+                      "%d ms, carrying on" % DEPOSIT_DRIVE_TIMEOUT_MS)
+                break
+
+            wait(DEPOSIT_DRIVE_POLL_MS)
+
         robot.stop()
     else:
         print("deposit: already within the correction distance, not driving")
@@ -1954,8 +1998,14 @@ def state_T():
     # clear the 60mm wall is exactly why the ball is dropped in from
     # above rather than lowered first.
     if not hub2_goal(GOAL_OPEN):
-        print("deposit: claw would not open")
-        return "Q"  # design.md Sec7: T -> Q on hub 2 FAULT or timeout
+        # design.md Sec7 sends this to Q, and that is where it belongs
+        # once Q does something. While Q is a blank stub, bailing there
+        # parks the robot mid-zone over a failed release and ends the
+        # run -- strictly worse than backing off and carrying on, which
+        # at least frees the robot to attempt the remaining victims.
+        # Same reasoning as the drive-up above: a stuck mechanism should
+        # not be able to strand the state machine.
+        print("deposit: WARNING claw would not open, continuing anyway")
 
     # Back off BEFORE returning, not at the start of the next state: the
     # robot is parked overhanging the zone wall, and whatever comes next
@@ -2081,10 +2131,30 @@ def gap_is_real():
     return True
 
 
+def reopen_claw():
+    """Put the claw back to open once the egress is over.
+
+    Non-fatal, like every other hub-2 call outside the capture itself: a
+    claw that will not reopen is a problem for the next run, not a reason
+    to strand the robot on the line it has just spent the whole egress
+    finding.
+    """
+    if not hub2_goal(GOAL_OPEN):
+        print("egress: WARNING claw would not reopen, carrying on")
+
+
 def state_K():
     """EGRESS (design.md Sec7) -- leave the zone by the edge it was
     entered from, feeling along the wall for the gap."""
     robot.stop()
+
+    # Claw in for the trip out. The egress runs the robot along a wall,
+    # then weaves it across ground nothing has looked at, and an open
+    # claw is the part most likely to catch on the zone edge or a wall on
+    # the way through the gap. Non-fatal if it refuses -- a stuck
+    # mechanism should not be able to prevent leaving the zone.
+    if not hub2_goal(GOAL_CLOSE):
+        print("egress: WARNING claw would not close, carrying on")
 
     base = _zone_heading0 if _zone_heading0 is not None else hub.imu.heading()
 
@@ -2176,11 +2246,13 @@ def state_K():
         if drive_until_black(watched, EGRESS_ZIGZAG_LEG_MM,
                              EGRESS_SPEED_MM_S):
             print("egress: line reacquired on leg %d" % (leg + 1))
+            reopen_claw()
             return "F"
 
         direction = -direction
 
     print("egress: no line after %d zigzag legs" % EGRESS_ZIGZAG_MAX_LEGS)
+    reopen_claw()   # back on the course either way, so not left clamped shut
     return "F"  # out of the zone either way; F will hunt for the line
 
 
