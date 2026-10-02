@@ -1079,7 +1079,7 @@ CAMERA_POLL_TRIES = 10          # enough when the aim is already correct
 # will echo at all, so any question that re-points the servo needs a much
 # bigger budget than one that doesn't. Same figures hub_camera_test.py
 # uses, for the same reason.
-CAMERA_AIM_SETTLE_MS = 1000
+CAMERA_AIM_SETTLE_MS = 1500
 CAMERA_AIM_POLL_TRIES = CAMERA_AIM_SETTLE_MS // CAMERA_POLL_GAP_MS + 10
 
 _camera_seq = 0
@@ -2073,22 +2073,29 @@ EGRESS_MAX_SIDESTEPS = 10      # 20 x 100mm is two metres of wall, well past
 # All untested placeholders, same as every other numeric constant here.
 
 
+def on_left_half():
+    """True if the robot is in the LEFT half of the zone.
+
+    Taken from the corner it last delivered to -- the two negative edge
+    angles are the left half of the zone, the two positive ones the
+    right -- falling back to where the last ball was captured if nothing
+    has been delivered, and to the right half if neither is known.
+    """
+    if _deposit_align_deg is not None:
+        return _deposit_align_deg < 0
+    if _captured_heading is not None:
+        return _captured_heading < 0
+    return False
+
+
 def zone_middle_turn_deg():
     """Relative bearing pointing across the zone, toward its middle.
 
-    Which half the robot is on comes from the corner it last delivered
-    to -- the two negative edge angles are the left half of the zone, the
-    two positive ones the right -- falling back to where the last ball
-    was captured if nothing has been delivered. Left half crosses to
-    +90, right half to -90.
+    Left half crosses to +90, right half to -90. Both are measured in
+    the ENTRY frame, so they are objective: unaffected by which way the
+    robot happens to be facing.
     """
-    if _deposit_align_deg is not None:
-        on_left = _deposit_align_deg < 0
-    elif _captured_heading is not None:
-        on_left = _captured_heading < 0
-    else:
-        on_left = False
-    return RECOVER_MIDDLE_TURN_DEG if on_left else -RECOVER_MIDDLE_TURN_DEG
+    return RECOVER_MIDDLE_TURN_DEG if on_left_half() else -RECOVER_MIDDLE_TURN_DEG
 
 
 def any_sensor_black():
@@ -2223,7 +2230,19 @@ def state_K():
 
     exit_heading = hub.imu.heading()  # the bearing the robot came out on;
                                       # legs alternate either side of it
-    direction = -1                    # first leg to the left
+
+    # First leg heads for the middle of the zone rather than the wall the
+    # robot is already beside. Note these are the robot's SUBJECTIVE
+    # left and right, and it is facing back OUT of the zone by now, so
+    # they are mirrored against the zone's objective sides: in the right
+    # half it swings to its own right, which is the zone's left, and vice
+    # versa. Either way the first leg is the one with room to run.
+    if on_left_half():
+        direction = -1   # robot's left == zone's right == toward the middle
+        print("egress: left half of the zone, first leg to the robot's left")
+    else:
+        direction = 1    # robot's right == zone's left == toward the middle
+        print("egress: right half of the zone, first leg to the robot's right")
 
     for leg in range(EGRESS_ZIGZAG_MAX_LEGS):
         rotate_to_relative(exit_heading, direction * EGRESS_ZIGZAG_ANGLE_DEG,

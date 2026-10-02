@@ -421,7 +421,7 @@ DEAD_BALL_MIN_DARK_FRACTION = 0.8
 # high-frequency detail - flat background cancels to near zero, texture leaves a
 # residue. Runs on a separate copy so nothing touches the displayed frame.
 TEXTURE_WINDOW = 2              # mean() half-window, (2n+1) square
-TEXTURE_MIN = 12                # residue counted as textured, 0-255
+TEXTURE_MIN = 8                # residue counted as textured, 0-255
 # Upper bound: a specular glint off the floor is a near-maximum spike in the
 # difference map, far brighter than the foil's internal facet variation.
 # Excluding the top of the range keeps moderate texture and drops blown glints.
