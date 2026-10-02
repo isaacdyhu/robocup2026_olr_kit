@@ -416,7 +416,7 @@ def hunt_for_branch(pivot_offset_mm, turn_sign, far_sensor):
 # only once the gyro itself confirms the target heading.
 OBSTACLE_TRIGGER_MM = 250         # design.md's exact figure -- ultrasonic
                                   # threshold for the F -> O guard
-OBSTACLE_SPIN_DEG = 80           # move 1: degrees to turn tangential to
+OBSTACLE_SPIN_DEG = 75           # move 1: degrees to turn tangential to
                                   # the tower
 OBSTACLE_LOOP_DEG = 130          # move 2: sweep back around the tower.
                                  # MUST stay well under 2 x OBSTACLE_SPIN_DEG.
@@ -429,7 +429,7 @@ OBSTACLE_LOOP_DEG = 130          # move 2: sweep back around the tower.
                                  # arc this long slip alone can eat a small
                                  # margin: 130 against a spin of 80 leaves
                                  # ~140mm of lateral room, 150 left only ~50.
-OBSTACLE_PIVOT_RADIUS_MM = 300   # move 2's pivot distance -- a fixed
+OBSTACLE_PIVOT_RADIUS_MM = 250   # move 2's pivot distance -- a fixed
                                   # assumed clearance rather than the
                                   # ultrasonic's live reading at trigger
                                   # time, so the loop's radius doesn't
@@ -1866,7 +1866,7 @@ DEPOSIT_BACKOFF_MM = 100      # reversed after releasing, BEFORE anything
                               # the chassis straight into it. Untested
                               # placeholder.
 
-DELIVERIES_TO_EGRESS = 1      # victims to deliver before giving up on the
+DELIVERIES_TO_EGRESS = 3      # victims to deliver before giving up on the
                               # zone and heading for the exit
 
 # The zone is a triangle in a corner, so its two straight edges run at
